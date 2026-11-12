@@ -215,7 +215,8 @@ async def jellyfin_refresh():
     try:
         async with aiohttp.ClientSession() as s:
             async with s.post(f"{url}/Library/Refresh",
-                              headers={"X-Emby-Token": key},
+                              headers={"Authorization": f'MediaBrowser Token="{key}"',
+                                       "X-Emby-Token": key},
                               timeout=aiohttp.ClientTimeout(total=30)) as r:
                 return "ok" if r.status in (200, 204) else f"HTTP {r.status}"
     except Exception as e:

@@ -460,7 +460,11 @@ async def run():
     global QUEUE
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     client = TelegramClient(SESSION, int(CFG["api_id"]), CFG["api_hash"])
-    await client.start()
+    await client.connect()
+    if not await client.is_user_authorized():
+        log.error("Not logged in. Run: cd /opt/tgmedia && venv/bin/python bot.py --login")
+        await client.disconnect()
+        raise SystemExit(2)
     me = await client.get_me()
     log.info("logged in as %s", me.username or me.id)
     QUEUE = asyncio.Queue()
@@ -497,8 +501,17 @@ async def login():
     await client.disconnect()
 
 
+async def check():
+    client = TelegramClient(SESSION, int(CFG["api_id"]), CFG["api_hash"])
+    await client.connect()
+    ok = await client.is_user_authorized()
+    await client.disconnect()
+    raise SystemExit(0 if ok else 1)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--login", action="store_true")
+    ap.add_argument("--check", action="store_true")
     a = ap.parse_args()
-    asyncio.run(login() if a.login else run())
+    asyncio.run(login() if a.login else check() if a.check else run())

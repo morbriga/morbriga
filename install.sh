@@ -107,7 +107,8 @@ EOF
 systemctl daemon-reload"
 
 # ---------- 4. Telegram login (interactive, once)
-if ! pct exec "$CTID" -- test -f /opt/tgmedia/session.session; then
+if ! pct exec "$CTID" -- bash -c "cd /opt/tgmedia && venv/bin/python bot.py --check"; then
+  pct exec "$CTID" -- rm -f /opt/tgmedia/session.session
   say "Telegram login — enter your phone (+972...), then the code Telegram sends you"
   pct exec "$CTID" -- bash -c "cd /opt/tgmedia && LANG=en_US.UTF-8 venv/bin/python bot.py --login" </dev/tty
 fi

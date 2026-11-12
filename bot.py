@@ -28,7 +28,9 @@ from pathlib import Path
 
 import aiohttp
 from guessit import guessit
-from telethon import TelegramClient, events
+from telethon import Button, TelegramClient, events
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
@@ -226,7 +228,7 @@ async def jellyfin_refresh():
 _refresh_task = None
 
 
-def schedule_refresh(client):
+def schedule_refresh():
     """Debounced: refresh 60s after the last completed download."""
     global _refresh_task
     if _refresh_task and not _refresh_task.done():
@@ -238,73 +240,108 @@ def schedule_refresh(client):
         log.info("jellyfin refresh: %s", res)
         if res not in ("ok",):
             if res == "no-key":
-                await notify(client, "ℹ️ ג'ליפין לא רוענן — חסר API Key. שלח כאן: /jellyfin <KEY>\n(בלי זה הקבצים יופיעו בסריקה המתוזמנת של ג'ליפין)")
+                await notify("ℹ️ ג'ליפין לא רוענן — חסר API Key. שלח כאן: /jellyfin <KEY>\n(בלי זה הקבצים יופיעו בסריקה המתוזמנת של ג'ליפין)")
             else:
-                await notify(client, f"⚠️ רענון ג'ליפין נכשל: {res}")
+                await notify(f"⚠️ רענון ג'ליפין נכשל: {res}")
 
     _refresh_task = asyncio.create_task(later())
 
 
-# ----------------------------------------------------------------- telegram
-async def notify(client, text, reply_to=None):
+# ----------------------------------------------------------------- telegram core
+USER: TelegramClient = None   # your account (downloads)
+BOT: TelegramClient = None    # control bot (UI) — optional
+OWNER_ID = None
+BOT_ID = None
+QUEUE: asyncio.Queue = None
+ACTIVE = {}
+
+KIND_BTN = [("🎬 סרטים", "movies"), ("🇮🇱 ישראלי", "israeli"), ("🧸 ילדים", "kids"), ("📺 סדרות", "series")]
+
+
+async def notify(text, buttons=None, edit=None):
+    """Send (or edit) a message to the owner — via the control bot if available, else Saved Messages."""
     try:
-        return await client.send_message("me", text, reply_to=reply_to)
+        if edit is not None:
+            return await edit.edit(text, buttons=buttons)
+        if BOT and OWNER_ID:
+            try:
+                return await BOT.send_message(OWNER_ID, text, buttons=buttons)
+            except Exception as e:
+                log.warning("bot send failed (did you press Start?): %s", e)
+        return await USER.send_message("me", text)
     except Exception as e:
         log.warning("notify failed: %s", e)
 
 
-QUEUE: asyncio.Queue = None
-ACTIVE = {}
-
-
 def norm(u):
-    return (u or "").lstrip("@").lower()
+    return str(u or "").lstrip("@").lower()
 
 
-async def chat_matches_source(event):
-    chat = await event.get_chat()
-    uname = norm(getattr(chat, "username", None))
-    cid = str(event.chat_id)
-    srcs = [norm(s) for s in STATE["sources"]]
-    return uname in srcs or cid in srcs
+def is_source(chat, chat_id):
+    srcs = {norm(s) for s in STATE["sources"]}
+    return norm(getattr(chat, "username", None)) in srcs or str(chat_id) in srcs
 
 
-async def enqueue(client, msg, origin=""):
+def add_source(key, name):
+    key = str(key)
+    STATE.setdefault("source_names", {})[key] = name
+    if norm(key) not in {norm(s) for s in STATE["sources"]}:
+        STATE["sources"].append(key)
+        persist()
+        return True
+    persist()
+    return False
+
+
+def source_label(s):
+    n = STATE.get("source_names", {}).get(str(s))
+    return f"{n} ({s})" if n and n != s else str(s)
+
+
+async def enqueue(msg, origin=""):
     key = f"{msg.chat_id}:{msg.id}"
     if key in STATE["done"] or key in ACTIVE:
         return
-    ACTIVE[key] = "queued"
+    ACTIVE[key] = origin
     await QUEUE.put((msg, origin))
     log.info("queued %s from %s", key, origin)
 
 
-async def worker(client, n):
+async def worker(n):
     while True:
         msg, origin = await QUEUE.get()
         key = f"{msg.chat_id}:{msg.id}"
         try:
-            await process(client, msg, origin)
+            await process(msg, origin)
             STATE["done"].append(key)
             persist()
         except Exception as e:
             log.exception("download failed %s", key)
-            await notify(client, f"❌ הורדה נכשלה ({origin}): {e}")
+            await notify(f"❌ הורדה נכשלה ({origin}): {e}")
         finally:
             ACTIVE.pop(key, None)
             QUEUE.task_done()
 
 
-async def process(client, msg, origin):
+def size_text(size):
+    return f"{size / 1024 ** 3:.2f}GB" if size > 1024 ** 3 else f"{size / 1024 ** 2:.0f}MB"
+
+
+def kind_buttons(rid, current):
+    return [[Button.inline(("✔️ " if k == current else "") + t, f"mv:{rid}:{k}".encode()) for t, k in KIND_BTN[:2]],
+            [Button.inline(("✔️ " if k == current else "") + t, f"mv:{rid}:{k}".encode()) for t, k in KIND_BTN[2:]]]
+
+
+async def process(msg, origin):
     fname = file_name_of(msg) or ""
-    caption = msg.message or ""
-    info = classify(fname, caption)
+    info = classify(fname, msg.message or "")
     dest = unique(target_path(info))
     size = msg.file.size if msg.file else 0
-    size_txt = f"{size / 1024 / 1024 / 1024:.2f}GB" if size > 1024 ** 3 else f"{size / 1024 / 1024:.0f}MB"
-    status = await notify(client, f"⬇️ מוריד: {info['title']} ({size_txt}) → {label(info['kind'])}")
+    head = f"⬇️ {info['title']} ({size_text(size)}) → {label(info['kind'])}"
+    status = await notify(head + "\n⏳ 0%")
 
     TMP.mkdir(parents=True, exist_ok=True)
-    tmp_file = TMP / f"{msg.chat_id}_{msg.id}{info['ext']}"
+    tmp_file = TMP / f"{abs(msg.chat_id)}_{msg.id}{info['ext']}"
     last = {"t": 0, "pct": -1}
 
     async def progress(cur, total):
@@ -312,191 +349,467 @@ async def process(client, msg, origin):
             return
         pct = int(cur * 100 / total)
         now = time.time()
-        if pct >= last["pct"] + 10 and now - last["t"] > 8:
+        if pct >= last["pct"] + 5 and now - last["t"] > 6:
             last.update(t=now, pct=pct)
+            bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
             try:
-                await status.edit(f"⬇️ מוריד: {info['title']} ({size_txt}) → {label(info['kind'])}  {pct}%")
+                await status.edit(f"{head}\n{bar} {pct}%")
             except Exception:
                 pass
 
     t0 = time.time()
-    path = await client.download_media(msg, file=str(tmp_file), progress_callback=progress)
+    path = await USER.download_media(msg, file=str(tmp_file), progress_callback=progress)
     if not path or not Path(path).exists() or (size and Path(path).stat().st_size < size * 0.99):
         raise RuntimeError("הקובץ לא ירד במלואו")
-
     dest.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(shutil.move, path, dest)
     mins = (time.time() - t0) / 60
     rel = dest.relative_to(media_root())
-    if status:
-        try:
-            await status.delete()
-        except Exception:
-            pass
-    done = await notify(
-        client,
-        f"✅ נשמר: {info['title']}\n📁 {rel}\n⏱ {mins:.1f} דק'\n\n"
-        f"קטגוריה לא נכונה? השב להודעה הזו: סרטים / ישראלי / ילדים / סדרות",
-    )
-    if done:
-        STATE["saved"][str(done.id)] = {"path": str(dest), "kind": info["kind"], "title": info["title"],
-                                        "year": info["year"], "season": info["season"],
-                                        "episode": info["episode"], "ext": info["ext"]}
+
+    STATE["seq"] = STATE.get("seq", 0) + 1
+    rid = str(STATE["seq"])
+    STATE["saved"][rid] = {"path": str(dest), "kind": info["kind"], "title": info["title"], "year": info["year"],
+                           "season": info["season"], "episode": info["episode"], "ext": info["ext"]}
     STATE["recent"].append(f"{time.strftime('%d/%m %H:%M')} {rel}")
     persist()
-    schedule_refresh(client)
+    text = f"✅ נשמר: {info['title']}\n📁 {rel}\n⏱ {mins:.1f} דק' · {size_text(size)}\n\nקטגוריה לא נכונה? בחר:"
+    if BOT and status and getattr(status, "sender_id", None) == BOT_ID:
+        await notify(text, buttons=kind_buttons(rid, info["kind"]), edit=status)
+    else:
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
+        await notify(text.replace("בחר:", "השב סרטים/ישראלי/ילדים/סדרות") + f"  #{rid}",
+                     buttons=kind_buttons(rid, info["kind"]) if BOT else None)
+    schedule_refresh()
 
 
-async def move_saved(client, event, rec, new_kind):
+async def move_saved(rid, new_kind):
+    rec = STATE["saved"].get(str(rid))
+    if not rec:
+        return "⚠️ הרשומה לא נמצאה"
     src = Path(rec["path"])
+    if rec["kind"] == new_kind:
+        return None
     if not src.exists():
-        await event.reply("⚠️ הקובץ כבר לא נמצא במיקום המקורי")
-        return
-    info = dict(rec)
-    info["kind"] = new_kind
+        return "⚠️ הקובץ כבר לא נמצא במיקום המקורי"
+    info = dict(rec, kind=new_kind)
     if new_kind == "series" and not info.get("season"):
         info["season"] = 1
     dest = unique(target_path(info))
     dest.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(shutil.move, str(src), dest)
-    # remove empty old folders
+    root = media_root()
     for d in (src.parent, src.parent.parent):
         try:
-            if d != media_root() and d.parent != media_root().parent and not any(d.iterdir()):
+            if root in d.parents and d.parent != root and not any(d.iterdir()):
                 d.rmdir()
+            elif root in d.parents and d.parent == root:
+                break
         except Exception:
             pass
     rec.update(path=str(dest), kind=new_kind)
     persist()
-    await event.reply(f"📦 הועבר ל: {dest.relative_to(media_root())}")
-    schedule_refresh(client)
+    schedule_refresh()
+    return f"📦 הועבר ל: {dest.relative_to(root)}"
 
 
-HELP = (
-    "🤖 בוט הסרטים — פקודות (כאן בהודעות שמורות):\n"
-    "/list — רשימת מקורות\n"
-    "/add @שם — הוספת מקור\n"
-    "/remove @שם — הסרת מקור\n"
-    "/status — תור והורדות אחרונות\n"
-    "/jellyfin KEY — הגדרת מפתח ג'ליפין\n"
-    "/refresh — רענון ג'ליפין עכשיו\n\n"
-    "העבר (Forward) לכאן הודעה מבוט/ערוץ חדש ← הוא נוסף כמקור.\n"
-    "העבר לכאן סרטון ← יורד מיד.\n"
-    "השב להודעת ✅ עם סרטים/ישראלי/ילדים/סדרות ← העברת תיקייה."
-)
+# ----------------------------------------------------------------- proxmox
+def pve_ok():
+    return bool(CFG.get("pve_url") and CFG.get("pve_token"))
 
 
-async def handle_control(client, event):
+async def pve(method, path, data=None):
+    url = CFG["pve_url"].rstrip("/") + "/api2/json" + path
+    hdr = {"Authorization": f"PVEAPIToken={CFG['pve_token']}"}
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, url, headers=hdr, data=data, ssl=False,
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
+            j = await r.json(content_type=None)
+            if r.status >= 400:
+                raise RuntimeError(f"Proxmox HTTP {r.status}: {j}")
+            return j.get("data")
+
+
+def fmt_bytes(b):
+    b = float(b or 0)
+    for u in ("B", "KB", "MB", "GB", "TB"):
+        if b < 1024:
+            return f"{b:.1f}{u}"
+        b /= 1024
+    return f"{b:.1f}PB"
+
+
+def fmt_up(sec):
+    sec = int(sec or 0)
+    d, h, m = sec // 86400, sec % 86400 // 3600, sec % 3600 // 60
+    return f"{d}d {h}h" if d else f"{h}h {m}m"
+
+
+def nas_space():
+    try:
+        u = shutil.disk_usage(media_root())
+        return f"💾 סינולוג'י: פנוי {fmt_bytes(u.free)} מתוך {fmt_bytes(u.total)} ({u.used * 100 // u.total}% בשימוש)"
+    except Exception as e:
+        return f"💾 סינולוג'י: לא נגיש ({e})"
+
+
+async def server_view():
+    if not pve_ok():
+        return "🖥 פרוקסמוקס לא מוגדר עדיין (הרץ את פקודת העדכון)", [[Button.inline("⬅️ תפריט", b"m:main")]]
+    lines, rows = [], []
+    for n in await pve("GET", "/nodes"):
+        st = await pve("GET", f"/nodes/{n['node']}/status")
+        mem = st.get("memory", {})
+        lines.append(f"🖥 {n['node']} — {'🟢' if n.get('status') == 'online' else '🔴'}  up {fmt_up(st.get('uptime'))}\n"
+                     f"   CPU {st.get('cpu', 0) * 100:.0f}% · RAM {fmt_bytes(mem.get('used'))}/{fmt_bytes(mem.get('total'))}"
+                     f" ({(mem.get('used', 0) * 100 // max(mem.get('total', 1), 1))}%)")
+    lines.append(nas_space())
+    res = await pve("GET", "/cluster/resources?type=vm")
+    res.sort(key=lambda x: x.get("vmid", 0))
+    lines.append("\nמכונות:")
+    btns = []
+    for v in res:
+        on = v.get("status") == "running"
+        icon = "🟢" if on else "🔴"
+        typ = "📦" if v.get("type") == "lxc" else "💻"
+        extra = f" · CPU {v.get('cpu', 0) * 100:.0f}% · {fmt_bytes(v.get('mem'))}" if on else ""
+        lines.append(f"{icon}{typ} {v['vmid']} {v.get('name', '')}{extra}")
+        btns.append(Button.inline(f"{icon} {v.get('name', v['vmid'])}"[:30],
+                                  f"vm:{v['node']}:{v['type']}:{v['vmid']}".encode()))
+    rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+    rows.append([Button.inline("🔄 רענן", b"m:srv"), Button.inline("⬅️ תפריט", b"m:main")])
+    return "\n".join(lines), rows
+
+
+async def vm_view(node, typ, vmid):
+    st = await pve("GET", f"/nodes/{node}/{typ}/{vmid}/status/current")
+    on = st.get("status") == "running"
+    txt = (f"{'🟢' if on else '🔴'} {st.get('name', vmid)} ({typ} {vmid})\n"
+           f"מצב: {st.get('status')}\n")
+    if on:
+        txt += (f"Uptime: {fmt_up(st.get('uptime'))}\nCPU: {st.get('cpu', 0) * 100:.0f}% מתוך {st.get('cpus')} ליבות\n"
+                f"RAM: {fmt_bytes(st.get('mem'))}/{fmt_bytes(st.get('maxmem'))}")
+    acts = [("🔄 ריסטרט", "reboot"), ("⏹ כיבוי", "shutdown"), ("⛔ כיבוי כפוי", "stop")] if on else [("▶️ הפעלה", "start")]
+    base = f"{node}:{typ}:{vmid}"
+    rows = [[Button.inline(t, f"va:{base}:{a}".encode()) for t, a in acts]]
+    rows.append([Button.inline("🔄 רענן", f"vm:{base}".encode()), Button.inline("⬅️ שרת", b"m:srv")])
+    return txt, rows
+
+
+ACT_HE = {"start": "הפעלה", "shutdown": "כיבוי", "reboot": "ריסטרט", "stop": "כיבוי כפוי"}
+
+
+# ----------------------------------------------------------------- bot UI
+def main_menu():
+    return ("🏠 לוח בקרה", [
+        [Button.inline("🎬 מדיה", b"m:media"), Button.inline("🖥 שרת", b"m:srv")],
+        [Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
+        [Button.inline("📊 הורדות", b"m:st"), Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
+    ])
+
+
+def media_view():
+    lines = ["🎬 מדיה", f"⏳ בתור/בהורדה: {len(ACTIVE)}", nas_space(),
+             f"🔑 ג'ליפין: {'מוגדר' if STATE.get('jellyfin_key') else 'חסר מפתח — שלח /jellyfin KEY'}"]
+    if STATE["recent"]:
+        lines += ["", "🕘 אחרונים:"] + STATE["recent"][-8:]
+    return "\n".join(lines), [[Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
+                              [Button.inline("🔄 רענון ג'ליפין", b"m:jf"), Button.inline("⬅️ תפריט", b"m:main")]]
+
+
+def sources_view():
+    rows = [[Button.inline(f"❌ {source_label(s)}"[:40], f"rm:{i}".encode())] for i, s in enumerate(STATE["sources"])]
+    rows.append([Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("⬅️ תפריט", b"m:main")])
+    return "📋 מקורות פעילים (לחיצה = הסרה):", rows
+
+
+async def add_view(page):
+    items = []
+    async for d in USER.iter_dialogs(limit=200):
+        ent = d.entity
+        is_bot = getattr(ent, "bot", False)
+        if not (d.is_channel or d.is_group or is_bot):
+            continue
+        if is_source(ent, d.id):
+            continue
+        icon = "🤖" if is_bot else ("📢" if d.is_channel and not d.is_group else "👥")
+        items.append((d.id, f"{icon} {d.name}"))
+    per = 12
+    chunk = items[page * per:(page + 1) * per]
+    rows = [[Button.inline(n[:40], f"ad:{i}".encode())] for i, n in chunk]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ הקודם", f"m:add:{page - 1}".encode()))
+    if (page + 1) * per < len(items):
+        nav.append(Button.inline("הבא ➡️", f"m:add:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("⬅️ תפריט", b"m:main")])
+    return ("➕ בחר ערוץ / קבוצה / בוט להוספה כמקור.\n"
+            "אפשר גם לשלוח לי @username או קישור t.me, או להעביר אליי הודעה ממנו."), rows
+
+
+async def resolve_and_add(text):
+    t = text.strip()
+    m = re.search(r"t\.me/(?:s/)?([A-Za-z0-9_+]+)", t)
+    ref = m.group(1) if m else t.lstrip("@")
+    ent = await USER.get_entity(ref if not ref.lstrip("-").isdigit() else int(ref))
+    pid = await USER.get_peer_id(ent)
+    name = getattr(ent, "title", None) or getattr(ent, "first_name", None) or ref
+    key = getattr(ent, "username", None) or str(pid)
+    new = add_source(key, name)
+    return f"{'➕ נוסף' if new else '✔️ כבר קיים'}: {name}"
+
+
+async def bot_text(event):
+    text = (event.raw_text or "").strip()
+    cmd, _, arg = text.partition(" ")
+    cmd = cmd.lower().split("@")[0]
+    if cmd in ("/start", "/menu", "/help"):
+        t, b = main_menu()
+        await event.respond(t, buttons=b)
+    elif cmd == "/media":
+        t, b = media_view(); await event.respond(t, buttons=b)
+    elif cmd == "/server":
+        t, b = await server_view(); await event.respond(t, buttons=b)
+    elif cmd == "/sources":
+        t, b = sources_view(); await event.respond(t, buttons=b)
+    elif cmd == "/add":
+        if arg:
+            await event.respond(await resolve_and_add(arg))
+        else:
+            t, b = await add_view(0); await event.respond(t, buttons=b)
+    elif cmd == "/status":
+        t, b = media_view(); await event.respond(t, buttons=b)
+    elif cmd == "/refresh":
+        await event.respond(f"🔄 רענון ג'ליפין: {await jellyfin_refresh()}")
+    elif cmd == "/jellyfin" and arg:
+        STATE["jellyfin_key"] = arg.strip(); persist()
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        r = await jellyfin_refresh()
+        await event.respond("✅ מפתח ג'ליפין נשמר ועובד" if r == "ok" else f"⚠️ נשמר, אבל בדיקה נכשלה: {r}")
+    elif event.message.fwd_from and not event.message.media:
+        peer = event.message.fwd_from.from_id
+        if peer is None:
+            await event.respond("⚠️ הערוץ הזה מסתיר את המקור. השתמש ב- /add ובחר מהרשימה.")
+            return
+        ent = await USER.get_entity(peer)
+        pid = await USER.get_peer_id(ent)
+        name = getattr(ent, "title", None) or getattr(ent, "first_name", None) or str(pid)
+        new = add_source(getattr(ent, "username", None) or str(pid), name)
+        await event.respond(f"{'➕ נוסף' if new else '✔️ כבר קיים'}: {name}")
+    elif text.startswith("@") or "t.me/" in text:
+        await event.respond(await resolve_and_add(text))
+    elif not event.message.media:
+        t, b = main_menu()
+        await event.respond(t, buttons=b)
+
+
+async def bot_callback(event):
+    data = event.data.decode()
+    parts = data.split(":")
+    edit = event.edit
+    if data == "m:main":
+        t, b = main_menu(); await edit(t, buttons=b)
+    elif data == "m:media" or data == "m:st":
+        t, b = media_view(); await edit(t, buttons=b)
+    elif data == "m:srv":
+        t, b = await server_view(); await edit(t, buttons=b)
+    elif data == "m:src":
+        t, b = sources_view(); await edit(t, buttons=b)
+    elif data == "m:jf":
+        await event.answer(f"רענון ג'ליפין: {await jellyfin_refresh()}", alert=True)
+        return
+    elif parts[0] == "m" and parts[1] == "add":
+        t, b = await add_view(int(parts[2])); await edit(t, buttons=b)
+    elif parts[0] == "ad":
+        ent = await USER.get_entity(int(parts[1]))
+        name = getattr(ent, "title", None) or getattr(ent, "first_name", None) or parts[1]
+        new = add_source(getattr(ent, "username", None) or parts[1], name)
+        await event.answer(("➕ נוסף: " if new else "✔️ כבר קיים: ") + name, alert=True)
+        t, b = await add_view(0); await edit(t, buttons=b)
+        return
+    elif parts[0] == "rm":
+        i = int(parts[1])
+        if 0 <= i < len(STATE["sources"]):
+            removed = STATE["sources"].pop(i); persist()
+            await event.answer(f"➖ הוסר: {source_label(removed)}")
+        t, b = sources_view(); await edit(t, buttons=b)
+        return
+    elif parts[0] == "mv":
+        rid, kind = parts[1], parts[2]
+        res = await move_saved(rid, kind)
+        if res:
+            rec = STATE["saved"].get(rid, {})
+            await edit(f"✅ {rec.get('title', '')}\n{res}\n\nקטגוריה לא נכונה? בחר:", buttons=kind_buttons(rid, kind))
+        await event.answer(res or "כבר בקטגוריה הזו")
+        return
+    elif parts[0] == "vm":
+        t, b = await vm_view(parts[1], parts[2], parts[3]); await edit(t, buttons=b)
+    elif parts[0] == "va":
+        node, typ, vmid, act = parts[1:5]
+        await edit(f"⚠️ לבצע {ACT_HE.get(act, act)} ל-{typ} {vmid}?", buttons=[
+            [Button.inline("✅ כן", f"vc:{node}:{typ}:{vmid}:{act}".encode()),
+             Button.inline("❌ ביטול", f"vm:{node}:{typ}:{vmid}".encode())]])
+    elif parts[0] == "vc":
+        node, typ, vmid, act = parts[1:5]
+        try:
+            await pve("POST", f"/nodes/{node}/{typ}/{vmid}/status/{act}")
+            await event.answer(f"✅ נשלחה פקודת {ACT_HE.get(act, act)}", alert=True)
+        except Exception as e:
+            await event.answer(f"❌ {e}"[:190], alert=True)
+        await asyncio.sleep(3)
+        t, b = await vm_view(node, typ, vmid); await edit(t, buttons=b)
+        return
+    try:
+        await event.answer()
+    except Exception:
+        pass
+
+
+async def saved_control(event):
+    """Fallback control from Saved Messages."""
     msg = event.message
     text = (msg.message or "").strip()
-
-    # forwarded into Saved Messages
-    if msg.fwd_from:
-        if is_video(msg):
-            await enqueue(client, msg, "העברה ידנית")
-            return
-        peer = msg.fwd_from.from_id
-        if peer is not None:
-            try:
-                ent = await client.get_entity(peer)
-                name = getattr(ent, "username", None) or str(await client.get_peer_id(ent))
-                if norm(name) not in [norm(s) for s in STATE["sources"]]:
-                    STATE["sources"].append(name)
-                    persist()
-                    await event.reply(f"➕ נוסף מקור: {name}")
-                else:
-                    await event.reply(f"✔️ {name} כבר ברשימת המקורות")
-            except Exception as e:
-                await event.reply(f"⚠️ לא הצלחתי לזהות את המקור: {e}")
+    if msg.fwd_from and is_video(msg):
+        await enqueue(msg, "העברה ידנית")
         return
-
-    # reply to a ✅ message with a category word
     if msg.is_reply and text:
-        rid = str(msg.reply_to_msg_id)
-        word = text.strip().lower()
-        if rid in STATE["saved"] and word in MOVE_WORDS:
-            await move_saved(client, event, STATE["saved"][rid], MOVE_WORDS[word])
+        m = re.search(r"#(\d+)", (await msg.get_reply_message()).message or "")
+        if m and text.lower() in MOVE_WORDS:
+            await event.reply(await move_saved(m.group(1), MOVE_WORDS[text.lower()]) or "כבר שם")
             return
-
     if not text.startswith("/"):
         return
     cmd, _, arg = text.partition(" ")
     cmd = cmd.lower()
     arg = arg.strip()
-    if cmd in ("/help", "/start"):
-        await event.reply(HELP)
-    elif cmd == "/list":
-        await event.reply("📋 מקורות:\n" + "\n".join(f"• {s}" for s in STATE["sources"]) or "אין מקורות")
-    elif cmd == "/add" and arg:
-        name = arg.lstrip("@")
-        if norm(name) not in [norm(s) for s in STATE["sources"]]:
-            STATE["sources"].append(name)
-            persist()
-        await event.reply(f"➕ נוסף מקור: {name}")
-    elif cmd == "/remove" and arg:
-        before = len(STATE["sources"])
-        STATE["sources"] = [s for s in STATE["sources"] if norm(s) != norm(arg)]
-        persist()
-        await event.reply("➖ הוסר" if len(STATE["sources"]) < before else "לא נמצא ברשימה")
-    elif cmd == "/jellyfin" and arg:
-        STATE["jellyfin_key"] = arg
-        persist()
+    if cmd == "/bot" and arg:
+        CFG["bot_token"] = arg
+        save_json(CONFIG_FILE, CFG)
         try:
             await msg.delete()
         except Exception:
             pass
-        res = await jellyfin_refresh()
-        await notify(client, "✅ מפתח ג'ליפין נשמר והרענון עובד" if res == "ok" else f"⚠️ נשמר, אבל בדיקה נכשלה: {res}")
-    elif cmd == "/refresh":
-        await event.reply(f"🔄 רענון ג'ליפין: {await jellyfin_refresh()}")
-    elif cmd == "/status":
-        lines = [f"⏳ בתור/בהורדה: {len(ACTIVE)}"]
-        if STATE["recent"]:
-            lines.append("\n🕘 אחרונים:")
-            lines += STATE["recent"][-8:]
-        await event.reply("\n".join(lines))
+        await USER.send_message("me", "🔁 טוקן נשמר — מפעיל מחדש. עכשיו פתח את הבוט שלך ולחץ Start.")
+        await asyncio.sleep(1)
+        os._exit(0)  # systemd restarts us with the bot enabled
+    elif cmd == "/jellyfin" and arg:
+        STATE["jellyfin_key"] = arg; persist()
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+        r = await jellyfin_refresh()
+        await USER.send_message("me", "✅ מפתח ג'ליפין נשמר ועובד" if r == "ok" else f"⚠️ נשמר, אבל בדיקה נכשלה: {r}")
+    elif cmd == "/add" and arg:
+        await event.reply(await resolve_and_add(arg))
+    elif cmd == "/list":
+        await event.reply("📋 מקורות:\n" + "\n".join(f"• {source_label(s)}" for s in STATE["sources"]))
+    elif cmd == "/remove" and arg:
+        STATE["sources"] = [s for s in STATE["sources"] if norm(s) != norm(arg)]; persist()
+        await event.reply("➖ הוסר")
+    elif cmd in ("/help", "/start"):
+        await event.reply("פקודות כאן: /bot TOKEN · /jellyfin KEY · /add @x · /list · /remove @x\n"
+                          "הכי נוח — דרך הבוט שלך (אחרי /bot TOKEN).")
 
 
+# ----------------------------------------------------------------- main
 async def run():
-    global QUEUE
+    global USER, BOT, OWNER_ID, BOT_ID, QUEUE
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    client = TelegramClient(SESSION, int(CFG["api_id"]), CFG["api_hash"])
-    await client.connect()
-    if not await client.is_user_authorized():
+    USER = TelegramClient(SESSION, int(CFG["api_id"]), CFG["api_hash"])
+    await USER.connect()
+    if not await USER.is_user_authorized():
         log.error("Not logged in. Run: cd /opt/tgmedia && venv/bin/python bot.py --login")
-        await client.disconnect()
         raise SystemExit(2)
-    me = await client.get_me()
-    log.info("logged in as %s", me.username or me.id)
+    me = await USER.get_me()
+    OWNER_ID = me.id
+    log.info("user: %s", me.username or me.id)
+
+    if CFG.get("bot_token"):
+        try:
+            BOT = TelegramClient(str(BASE / "bot_session"), int(CFG["api_id"]), CFG["api_hash"])
+            await BOT.start(bot_token=CFG["bot_token"])
+            bme = await BOT.get_me()
+            BOT_ID = bme.id
+            log.info("control bot: @%s", bme.username)
+            await BOT(SetBotCommandsRequest(scope=BotCommandScopeDefault(), lang_code="", commands=[
+                BotCommand("menu", "🏠 לוח בקרה"),
+                BotCommand("media", "🎬 מדיה והורדות"),
+                BotCommand("server", "🖥 מצב שרת ומכונות"),
+                BotCommand("add", "➕ הוספת מקור"),
+                BotCommand("sources", "📋 מקורות"),
+                BotCommand("refresh", "🔄 רענון ג'ליפין"),
+            ]))
+            owner_only = lambda e: e.sender_id == OWNER_ID
+
+            @BOT.on(events.NewMessage(func=owner_only))
+            async def _bt(event):
+                try:
+                    await bot_text(event)
+                except Exception as e:
+                    log.exception("bot text")
+                    await event.respond(f"⚠️ שגיאה: {e}")
+
+            @BOT.on(events.CallbackQuery(func=owner_only))
+            async def _bc(event):
+                try:
+                    await bot_callback(event)
+                except Exception as e:
+                    log.exception("bot callback")
+                    try:
+                        await event.answer(f"⚠️ {e}"[:190], alert=True)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log.exception("control bot failed")
+            BOT = None
+            await USER.send_message("me", f"⚠️ בוט השליטה לא עלה: {e}")
+
     QUEUE = asyncio.Queue()
     for i in range(int(CFG.get("workers", 2))):
-        asyncio.create_task(worker(client, i))
+        asyncio.create_task(worker(i))
 
-    @client.on(events.NewMessage(incoming=True))
+    @USER.on(events.NewMessage(incoming=True))
     async def on_incoming(event):
-        if event.is_private and event.chat_id == me.id:
+        if event.chat_id in (OWNER_ID, BOT_ID):
             return
-        if is_video(event.message) and await chat_matches_source(event):
+        if is_video(event.message):
             chat = await event.get_chat()
-            await enqueue(client, event.message, getattr(chat, "username", None) or str(event.chat_id))
+            if is_source(chat, event.chat_id):
+                await enqueue(event.message, getattr(chat, "title", None) or getattr(chat, "username", None) or str(event.chat_id))
 
-    @client.on(events.NewMessage(chats="me"))
-    async def on_saved(event):
-        try:
-            await handle_control(client, event)
-        except Exception as e:
-            log.exception("control error")
-            await event.reply(f"⚠️ שגיאה: {e}")
+    @USER.on(events.NewMessage(outgoing=True))
+    async def on_outgoing(event):
+        if BOT_ID and event.chat_id == BOT_ID and is_video(event.message):
+            await enqueue(event.message, "העברה לבוט")
+        elif event.chat_id == OWNER_ID:
+            try:
+                await saved_control(event)
+            except Exception as e:
+                log.exception("saved control")
+                await event.reply(f"⚠️ שגיאה: {e}")
 
     if not media_root().exists():
-        await notify(client, f"⚠️ תיקיית המדיה {media_root()} לא נגישה — בדוק את החיבור לסינולוג'י")
-    await notify(client, "🟢 בוט הסרטים פעיל. שלח /help לרשימת פקודות.")
-    await client.run_until_disconnected()
+        await notify(f"⚠️ תיקיית המדיה {media_root()} לא נגישה — בדוק את החיבור לסינולוג'י")
+    if BOT:
+        t, b = main_menu()
+        await notify("🟢 המערכת עלתה.\n" + t, buttons=b)
+    else:
+        await notify("🟢 בוט הסרטים פעיל. ליצירת לוח בקרה: צור בוט ב-@BotFather ושלח כאן /bot TOKEN")
+    await USER.run_until_disconnected()
 
 
 async def login():
     client = TelegramClient(SESSION, int(CFG["api_id"]), CFG["api_hash"])
-    await client.start()  # interactive: phone, code, 2FA password
+    await client.start()
     me = await client.get_me()
     print(f"\n✅ מחובר בתור {me.first_name} (@{me.username})")
     await client.disconnect()

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # tg-media-bot updater — run on the Proxmox HOST shell.
 # Pulls latest bot.py, gives the bot a limited Proxmox API token, restarts.
-set -euo pipefail
+set -uo pipefail
+trap 'echo -e "\n\e[1;31m✖ failed at line $LINENO (exit $?)\e[0m"; exit 1' ERR
+set -E
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/morbriga/morbriga/tg-media-bot}"
 say() { echo -e "\n\e[1;36m==> $*\e[0m"; }
 
@@ -9,9 +11,12 @@ CTID=$(pct list | awk '$NF=="tg-media-bot" {print $1}')
 [ -n "$CTID" ] || { echo "container tg-media-bot not found — run install.sh first"; exit 1; }
 
 say "Updating code in container $CTID"
-pct exec "$CTID" -- bash -c "cd /opt/tgmedia && curl -fsSL '${REPO_RAW}/bot.py?$(date +%s)' -o bot.py.new && \
-  curl -fsSL '${REPO_RAW}/requirements.txt?$(date +%s)' -o requirements.txt && \
-  venv/bin/pip install -q -r requirements.txt && mv bot.py.new bot.py"
+pct exec "$CTID" -- curl -fSL --retry 3 -o /opt/tgmedia/bot.py.new "${REPO_RAW}/bot.py"
+pct exec "$CTID" -- curl -fSL --retry 3 -o /opt/tgmedia/requirements.txt "${REPO_RAW}/requirements.txt"
+pct exec "$CTID" -- /opt/tgmedia/venv/bin/python -m py_compile /opt/tgmedia/bot.py.new
+pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requirements.txt --disable-pip-version-check -q
+pct exec "$CTID" -- mv /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
+echo "code updated"
 
 if ! pct exec "$CTID" -- grep -q '"pve_token"' /opt/tgmedia/config.json; then
   say "Creating limited Proxmox API user for the bot (view + start/stop only)"

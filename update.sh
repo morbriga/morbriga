@@ -29,8 +29,8 @@ if ! pct exec "$CTID" -- bash -c "command -v ffmpeg && command -v arp-scan" >/de
   say "Installing ffmpeg (YouTube) and arp-scan (network scanner)"
   pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg arp-scan >/dev/null"
 fi
-pct exec "$CTID" -- ln -sf /usr/share/zoneinfo/Asia/Jerusalem /etc/localtime
-pct exec "$CTID" -- mkdir -p "/media/video/YouTube/ילדים"
+pct exec "$CTID" -- ln -sf /usr/share/zoneinfo/Asia/Jerusalem /etc/localtime || true
+pct exec "$CTID" -- mkdir -p "/media/video/YouTube/ילדים" || true
 
 if ! pct exec "$CTID" -- test -f /etc/systemd/system/qbittorrent.service; then
   say "Installing qBittorrent (localhost only, controlled by the bot)"
@@ -92,7 +92,7 @@ print(json.dumps(c, ensure_ascii=False, indent=2))")
   printf '%s\n' "$NEW" | pct exec "$CTID" -- bash -c "umask 077; cat > /opt/tgmedia/config.json"
 fi
 
-pct exec "$CTID" -- systemctl restart tg-media-bot
+pct exec "$CTID" -- systemctl restart tg-media-bot || true
 sleep 6
 pct exec "$CTID" -- systemctl is-active tg-media-bot >/dev/null && say "✅ Updated. Check Telegram." || \
   pct exec "$CTID" -- journalctl -u tg-media-bot -n 30 --no-pager

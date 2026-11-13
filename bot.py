@@ -37,8 +37,8 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-dropbox"
-CHANGES = "☁️ הורדה מקישורי דרופבוקס (קובץ או תיקייה שלמה) לטיולים/אירועים/סרטים"
+VERSION = "2026.11.13-gdrive"
+CHANGES = "☁️ הורדה מקישורי גוגל דרייב ודרופבוקס (קובץ או תיקייה שלמה) לטיולים/אירועים/סרטים"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
 CONFIG_FILE = BASE / "config.json"
@@ -1704,6 +1704,63 @@ async def dbx_job(url, dest_kind):
             pass
 
 
+# ----------------------------------------------------------------- Google Drive links (gdown)
+GD_RE = re.compile(r"https?://(?:drive|docs)\.google\.com/\S+")
+
+
+def _dir_size(p):
+    return sum(f.stat().st_size for f in Path(p).rglob("*") if f.is_file())
+
+
+async def gdrive_job(url, dest_kind):
+    import gdown
+    status = await notify("☁️ גוגל דרייב: מתחיל הורדה…")
+    work = TMP / f"gd_{int(time.time())}"
+    work.mkdir(parents=True, exist_ok=True)
+    is_folder = "/folders/" in url
+    try:
+        def run():
+            if is_folder:
+                return gdown.download_folder(url, output=str(work), quiet=True, remaining_ok=True, use_cookies=False)
+            return gdown.download(url, output=str(work) + "/", quiet=True, fuzzy=True, use_cookies=False)
+        task = asyncio.create_task(asyncio.to_thread(run))
+        while not task.done():
+            await asyncio.sleep(8)
+            try:
+                await status.edit(f"☁️ גוגל דרייב: {'תיקייה' if is_folder else 'קובץ'}\n⬇️ {fmt_bytes(_dir_size(work))}")
+            except Exception:
+                pass
+        res = task.result()
+        if not res:
+            raise RuntimeError("ההורדה נכשלה — ודא שהקישור משותף ל'כל מי שיש לו את הקישור'")
+        files = [f for f in work.rglob("*") if f.is_file() and f.suffix.lower() in MEDIA_KEEP]
+        if not files:
+            raise RuntimeError("לא נמצאו סרטונים או תמונות בקישור")
+        subdirs = [d for d in work.iterdir() if d.is_dir()]
+        name = subdirs[0].name if is_folder and subdirs else files[0].stem
+        stem = clean_title(name) or "Google Drive"
+        root = {"trip": media_root() / "טיולים" / stem, "event": media_root() / stem, "movie": None}[dest_kind]
+        moved = 0
+        for f in files:
+            if dest_kind == "movie":
+                if f.suffix.lower() not in VIDEO_EXT:
+                    continue
+                out = unique(target_path(classify(f.name, "")))
+            else:
+                out = unique(root / f.name)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.move, str(f), out)
+            moved += 1
+        where = root.relative_to(media_root()) if root else "סרטים"
+        await notify(f"✅ גוגל דרייב: נשמרו {moved} קבצים\n📁 {where}", edit=status)
+        if moved:
+            schedule_refresh()
+    except Exception as e:
+        await notify(f"❌ גוגל דרייב נכשל: {e}"[:300], edit=status)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
@@ -1840,11 +1897,13 @@ async def bot_text(event):
         else:
             t, b = await jf_libraries_view(); await event.respond(t, buttons=b)
         return
-    if DBX_RE.search(text) and not cmd.startswith("/"):
+    cloud = DBX_RE.search(text) or GD_RE.search(text)
+    if cloud and not cmd.startswith("/"):
         STATE["seq"] = STATE.get("seq", 0) + 1
         k = str(STATE["seq"])
-        DBX_PENDING[k] = DBX_RE.search(text).group(0)
-        await event.respond("☁️ קישור דרופבוקס — לאן לשמור?", buttons=[[
+        src = "dbx" if DBX_RE.search(text) else "gd"
+        DBX_PENDING[k] = (src, cloud.group(0))
+        await event.respond(f"☁️ קישור {'דרופבוקס' if src == 'dbx' else 'גוגל דרייב'} — לאן לשמור?", buttons=[[
             Button.inline("🏝 טיולים", f"dbx:{k}:trip".encode()), Button.inline("🎉 אירועים", f"dbx:{k}:event".encode())],
             [Button.inline("🎬 סרטים", f"dbx:{k}:movie".encode()), Button.inline("❌ ביטול", f"dbx:{k}:x".encode())]])
         return
@@ -2039,12 +2098,13 @@ async def bot_callback(event):
         await edit(dev_text(d), buttons=dev_buttons(mac))
         return
     elif parts[0] == "dbx":
-        url = DBX_PENDING.pop(parts[1], None)
-        if parts[2] == "x" or not url:
+        pend = DBX_PENDING.pop(parts[1], None)
+        if parts[2] == "x" or not pend:
             await edit("❌ בוטל" if parts[2] == "x" else "⚠️ הבקשה פגה — שלח את הקישור שוב")
             return
+        src, url = pend
         await edit({"trip": "🏝 יורד לטיולים…", "event": "🎉 יורד לאירועים…", "movie": "🎬 יורד לסרטים…"}[parts[2]])
-        asyncio.create_task(dbx_job(url, parts[2]))
+        asyncio.create_task((dbx_job if src == "dbx" else gdrive_job)(url, parts[2]))
         return
     elif parts[0] == "yt":
         url = YT_PENDING.pop(parts[1], None)

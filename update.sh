@@ -2,7 +2,7 @@
 # tg-media-bot updater — run on the Proxmox HOST shell.
 # Pulls latest bot.py, gives the bot a limited Proxmox API token, restarts.
 set -uo pipefail
-trap 'echo -e "\n\e[1;31m✖ failed at line $LINENO (exit $?)\e[0m"; exit 1' ERR
+trap 'rc=$?; echo -e "\n\e[1;31m✖ failed (exit $rc): $BASH_COMMAND\e[0m"; exit 1' ERR
 set -E
 REPO_RAW="${REPO_RAW:-https://raw.githubusercontent.com/morbriga/morbriga/tg-media-bot}"
 say() { echo -e "\n\e[1;36m==> $*\e[0m"; }
@@ -11,11 +11,14 @@ CTID=$(pct list | awk '$NF=="tg-media-bot" {print $1}')
 [ -n "$CTID" ] || { echo "container tg-media-bot not found — run install.sh first"; exit 1; }
 
 say "Updating code in container $CTID"
-pct exec "$CTID" -- curl -fSL --retry 3 -o /opt/tgmedia/bot.py.new "${REPO_RAW}/bot.py"
-pct exec "$CTID" -- curl -fSL --retry 3 -o /opt/tgmedia/requirements.txt "${REPO_RAW}/requirements.txt"
+pct exec "$CTID" -- curl -fsSL --retry 3 -o /opt/tgmedia/bot.py.new "${REPO_RAW}/bot.py"
+pct exec "$CTID" -- curl -fsSL --retry 3 -o /opt/tgmedia/requirements.txt "${REPO_RAW}/requirements.txt"
+echo "-- checking code"
 pct exec "$CTID" -- /opt/tgmedia/venv/bin/python -m py_compile /opt/tgmedia/bot.py.new
-pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requirements.txt --disable-pip-version-check -q
-pct exec "$CTID" -- mv /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
+echo "-- installing python packages"
+pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requirements.txt --disable-pip-version-check --progress-bar off
+echo "-- replacing bot.py"
+pct exec "$CTID" -- cp -f /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
 echo "code updated"
 
 if ! pct exec "$CTID" -- bash -c "command -v ffmpeg && command -v arp-scan" >/dev/null 2>&1; then

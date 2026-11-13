@@ -37,8 +37,8 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-gdrive2"
-CHANGES = "☁️ הורדה מקישורי גוגל דרייב ודרופבוקס (קובץ או תיקייה שלמה) לטיולים/אירועים/סרטים"
+VERSION = "2026.11.13-restore2"
+CHANGES = "♻️ שחזור אוטומטי של כל השמות והתמונות שתיקנת מהצ'אט (רץ לבד, מנסה שוב עד שהכל נמצא)"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
 CONFIG_FILE = BASE / "config.json"
@@ -1421,20 +1421,29 @@ async def collect_fixes():
     return fixes
 
 
+def _nk(x):
+    import unicodedata
+    return unicodedata.normalize("NFC", str(x or "")).strip().lower()
+
+
 async def restore_fixes(progress=None):
     fixes = await collect_fixes()
     if not fixes:
-        return "לא נמצאו תיקונים בהיסטוריה."
+        return "לא נמצאו תיקונים בהיסטוריה של הצ'אט.", 0
     res = await jf("GET", "/Items", params={"Recursive": "true", "Fields": "Path",
                                             "IncludeItemTypes": "Movie,Series,Video,Episode"})
-    index = {}
+    by_full, by_file, by_folder = {}, {}, {}
     for it in res.get("Items", []):
-        p = it.get("Path") or ""
-        if p:
-            index[(Path(p).parent.name, Path(p).name)] = it["Id"]
+        p = Path(it.get("Path") or "")
+        if not str(p):
+            continue
+        by_full[(_nk(p.parent.name), _nk(p.name))] = it["Id"]
+        by_file.setdefault(_nk(p.name), it["Id"])
+        by_folder.setdefault(_nk(p.name if it.get("Type") == "Series" else p.parent.name), it["Id"])
     ok_n, ok_i, missing, errors = 0, 0, [], []
     for (folder, fname), rec in fixes.items():
-        item_id = index.get((folder, fname))
+        item_id = (by_full.get((_nk(folder), _nk(fname))) or by_file.get(_nk(fname))
+                   or by_folder.get(_nk(fname)) or by_folder.get(_nk(folder)))
         if not item_id:
             missing.append(rec.get("name") or fname)
             continue
@@ -1449,15 +1458,41 @@ async def restore_fixes(progress=None):
                 await jf_image(item_id, rec["img_url"])
                 ok_i += 1
         except Exception as e:
-            errors.append(f"{rec.get('name') or fname}: {e}"[:80])
-    lines = [f"♻️ שוחזרו {ok_n} שמות ו-{ok_i} תמונות (מתוך {len(fixes)} פריטים שתיקנת)."]
+            errors.append(f"{rec.get('name') or fname}: {e}"[:100])
+    n_names = sum(1 for r in fixes.values() if r.get("name"))
+    n_imgs = sum(1 for r in fixes.values() if r.get("img_msg") or r.get("img_url"))
+    lines = [f"♻️ מצאתי בצ'אט {len(fixes)} סרטים שתיקנת ({n_names} שמות, {n_imgs} תמונות).",
+             f"✅ הוחלו מחדש: {ok_n} שמות, {ok_i} תמונות."]
     if missing:
-        lines.append(f"\n⏳ לא נמצאו עדיין בג'ליפין ({len(missing)}) — כנראה הסריקה עוד רצה, הרץ /restore שוב בעוד כמה דקות:")
-        lines += [f"• {x}" for x in missing[:15]]
+        lines.append(f"\n⏳ עוד לא נמצאו בג'ליפין ({len(missing)}) — אנסה שוב אוטומטית בעוד 10 דקות:")
+        lines += [f"• {x}" for x in missing[:20]]
     if errors:
         lines.append("\n❌ שגיאות:")
         lines += errors[:10]
-    return "\n".join(lines)
+    return "\n".join(lines), len(missing)
+
+
+async def restore_auto():
+    """Run once after update; retry while items are still being scanned."""
+    if STATE.get("restore_done") or not STATE.get("jellyfin_key") or not BOT_ID:
+        return
+    await asyncio.sleep(30)
+    try:
+        await jf_protect_libraries()
+    except Exception as e:
+        log.warning("protect: %s", e)
+    for attempt in range(6):
+        try:
+            out, missing = await restore_fixes()
+        except Exception as e:
+            out, missing = f"❌ שחזור נכשל: {e}"[:300], 1
+        if attempt == 0 or not missing or attempt == 5:
+            await notify(out)
+        if not missing:
+            break
+        await asyncio.sleep(600)
+    STATE["restore_done"] = True
+    persist()
 
 
 # ----------------------------------------------------------------- automatic library cleanup
@@ -1883,7 +1918,7 @@ async def bot_text(event):
         msg = await event.respond("♻️ קורא את היסטוריית התיקונים ומשחזר… (יכול לקחת דקה)")
         try:
             prot = await jf_protect_libraries()
-            out = await restore_fixes()
+            out, _ = await restore_fixes()
             out += f"\n\n🛡 מעכשיו ג'ליפין שומר שמות ותמונות ליד הקבצים ב-{prot} ספריות — הם ישרדו שינויי ספריות."
         except Exception as e:
             out = f"❌ {e}"[:400]
@@ -2292,6 +2327,7 @@ async def run():
     QUEUE = asyncio.Queue()
     asyncio.create_task(tor_monitor())
     asyncio.create_task(updater_loop())
+    asyncio.create_task(restore_auto())
     asyncio.create_task(ensure_apt())
     if CFG.get("net_enabled", True):
         asyncio.create_task(net_monitor())

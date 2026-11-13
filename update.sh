@@ -11,14 +11,18 @@ CTID=$(pct list | awk '$NF=="tg-media-bot" {print $1}')
 [ -n "$CTID" ] || { echo "container tg-media-bot not found — run install.sh first"; exit 1; }
 
 say "Updating code in container $CTID"
-pct exec "$CTID" -- curl -fsSL --retry 3 -o /opt/tgmedia/bot.py.new "${REPO_RAW}/bot.py"
-pct exec "$CTID" -- curl -fsSL --retry 3 -o /opt/tgmedia/requirements.txt "${REPO_RAW}/requirements.txt"
+TMPD=$(mktemp -d)
+curl -fsSL --retry 3 -o "$TMPD/bot.py" "${REPO_RAW}/bot.py"
+curl -fsSL --retry 3 -o "$TMPD/requirements.txt" "${REPO_RAW}/requirements.txt"
 echo "-- checking code"
-pct exec "$CTID" -- /opt/tgmedia/venv/bin/python -m py_compile /opt/tgmedia/bot.py.new
+python3 -m py_compile "$TMPD/bot.py"
+echo "-- copying into container"
+pct push "$CTID" "$TMPD/requirements.txt" /opt/tgmedia/requirements.txt
+pct push "$CTID" "$TMPD/bot.py" /opt/tgmedia/bot.py
+rm -rf "$TMPD"
 echo "-- installing python packages"
-pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requirements.txt --disable-pip-version-check --progress-bar off
-echo "-- replacing bot.py"
-pct exec "$CTID" -- cp -f /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
+pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -q -r /opt/tgmedia/requirements.txt --disable-pip-version-check --progress-bar off || \
+  echo "   (pip returned an error — continuing)"
 echo "code updated"
 
 if ! pct exec "$CTID" -- bash -c "command -v ffmpeg && command -v arp-scan" >/dev/null 2>&1; then

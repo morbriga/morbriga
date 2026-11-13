@@ -23,6 +23,7 @@ import logging
 import os
 import re
 import shutil
+import socket
 import time
 from pathlib import Path
 
@@ -701,13 +702,342 @@ async def torrents_view():
     return txt, rows
 
 
+# ----------------------------------------------------------------- YouTube (yt-dlp)
+YT_RE = re.compile(r"https?://(?:www\.|m\.|music\.)?(?:youtube\.com/(?:watch\?\S+|playlist\?\S+|shorts/\S+|@\S+|live/\S+)|youtu\.be/\S+)")
+YT_PENDING = {}
+YT_LOCK = asyncio.Lock()
+
+
+def yt_root(kids=False):
+    r = media_root() / "YouTube"
+    return r / "ילדים" if kids else r
+
+
+def yt_run(url, outdir, prog):
+    from yt_dlp import YoutubeDL
+
+    def hook(d):
+        info = d.get("info_dict") or {}
+        prog["title"] = info.get("title") or prog.get("title")
+        prog["idx"] = info.get("playlist_index") or prog.get("idx")
+        prog["n"] = info.get("n_entries") or info.get("playlist_count") or prog.get("n")
+        if d.get("status") == "downloading":
+            tot = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            prog["pct"] = int(d.get("downloaded_bytes", 0) * 100 / tot) if tot else prog.get("pct", 0)
+            prog["speed"] = d.get("speed") or 0
+        elif d.get("status") == "finished":
+            prog["files"] = prog.get("files", 0) + 1
+
+    def pp_hook(d):
+        if d.get("status") == "finished" and d.get("postprocessor") in ("MoveFiles", "MoveFilesAfterDownload"):
+            prog["done"] = prog.get("done", 0) + 1
+            fp = (d.get("info_dict") or {}).get("filepath")
+            if fp:
+                prog["last_dir"] = str(Path(fp).parent)
+
+    (TMP / "yt").mkdir(parents=True, exist_ok=True)
+    opts = {
+        "format": "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/bv*[height<=1080]+ba/b[height<=1080]/b",
+        "merge_output_format": "mp4",
+        "paths": {"home": str(outdir), "temp": str(TMP / "yt")},
+        "outtmpl": "%(playlist_title,channel,uploader|YouTube)s/%(title).120B [%(id)s].%(ext)s",
+        "windowsfilenames": True,
+        "writethumbnail": True,
+        "postprocessors": [{"key": "FFmpegThumbnailsConvertor", "format": "jpg"},
+                           {"key": "FFmpegMetadata"}],
+        "progress_hooks": [hook],
+        "postprocessor_hooks": [pp_hook],
+        "ignoreerrors": True,
+        "quiet": True,
+        "no_warnings": True,
+        "retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "download_archive": str(BASE / "yt_archive.txt"),
+    }
+    with YoutubeDL(opts) as y:
+        info = y.extract_info(url, download=True)
+    prog["finished"] = True
+    return info
+
+
+async def yt_job(url, kids):
+    async with YT_LOCK:
+        outdir = yt_root(kids)
+        outdir.mkdir(parents=True, exist_ok=True)
+        prog = {"pct": 0}
+        status = await notify(f"▶️ YouTube: מתחיל…\n{url}")
+        task = asyncio.create_task(asyncio.to_thread(yt_run, url, outdir, prog))
+        last = ""
+        while not task.done():
+            await asyncio.sleep(8)
+            pl = f" ({prog.get('idx')}/{prog.get('n')})" if prog.get("n") else ""
+            txt = (f"▶️ YouTube{pl}\n{(prog.get('title') or '')[:80]}\n"
+                   f"{'▓' * (prog.get('pct', 0) // 10)}{'░' * (10 - prog.get('pct', 0) // 10)} {prog.get('pct', 0)}%"
+                   f" · ⚡ {fmt_bytes(prog.get('speed'))}/s")
+            if txt != last and status:
+                last = txt
+                try:
+                    await status.edit(txt)
+                except Exception:
+                    pass
+        try:
+            info = task.result()
+        except Exception as e:
+            await notify(f"❌ YouTube נכשל: {e}"[:400], edit=status)
+            return
+        n = prog.get("done") or (1 if info else 0)
+        where = prog.get("last_dir")
+        rel = Path(where).relative_to(media_root()) if where and media_root() in Path(where).parents else outdir.name
+        title = (info or {}).get("title", "")
+        txt = (f"✅ YouTube: ירדו {n} סרטונים\n🎞 {title[:80]}\n📁 {rel}" if n else
+               f"ℹ️ לא ירד שום דבר חדש (אולי כבר הורד בעבר)\n🎞 {title[:80]}")
+        await notify(txt, edit=status)
+        if n:
+            schedule_refresh()
+
+
+# ----------------------------------------------------------------- network scanner
+NET_PORTS = [21, 22, 23, 53, 80, 139, 443, 445, 515, 548, 554, 631, 1883, 3000, 3389, 5000, 5001, 5357, 5555,
+             5900, 6053, 6668, 7000, 8000, 8001, 8006, 8008, 8009, 8080, 8096, 8123, 8443, 8899, 9000, 9100,
+             32400, 34567, 37777, 49152, 62078]
+PORT_NAMES = {22: "SSH", 23: "Telnet", 53: "DNS", 80: "HTTP", 139: "NetBIOS", 443: "HTTPS", 445: "SMB", 515: "LPD",
+              548: "AFP", 554: "RTSP", 631: "IPP", 1883: "MQTT", 3389: "RDP", 5000: "DSM", 5001: "DSM-SSL",
+              5357: "WSD", 5555: "ADB", 5900: "VNC", 6053: "ESPHome", 6668: "Tuya", 7000: "AirPlay",
+              8000: "Hik-SDK", 8001: "TV-API", 8006: "Proxmox", 8008: "Cast", 8009: "Cast", 8080: "HTTP-alt",
+              8096: "Jellyfin", 8123: "HA", 8443: "HTTPS-alt", 9100: "Printer", 32400: "Plex", 34567: "DVR",
+              37777: "Dahua", 62078: "iOS"}
+
+
+def mac_random(mac):
+    try:
+        return int(mac.split(":")[0], 16) & 0x02 == 2
+    except Exception:
+        return False
+
+
+def guess_type(d):
+    v = (d.get("vendor") or "").lower()
+    p = set(d.get("ports") or [])
+    h = f"{d.get('hostname') or ''} {d.get('title') or ''} {d.get('server') or ''}".lower()
+    has = lambda *ws: any(w in v or w in h for w in ws)
+    if 8006 in p or "proxmox" in h:
+        return "🖥 שרת Proxmox"
+    if has("synology") or {5000, 5001} & p and "synology" in h:
+        return "💾 Synology NAS"
+    if 8123 in p or "home assistant" in h:
+        return "🏠 Home Assistant"
+    if has("hikvision", "dahua", "uniview", "reolink", "hangzhou", "ezviz", "imou", "axis", "hanwha", "tiandy") \
+            or {554, 8000, 37777, 34567} & p and not {445, 3389} & p:
+        return "📹 מצלמה / NVR"
+    if {9100, 631, 515} & p or has("printer", "laserjet", "epson", "canon", "brother", "xerox", "kyocera"):
+        return "🖨 מדפסת"
+    if 8096 in p:
+        return "🎬 Jellyfin"
+    if {8008, 8009} & p or has("chromecast", "google home", "nest"):
+        return "📺 Chromecast / Google"
+    if 62078 in p:
+        return "📱 iPhone / iPad"
+    if has("apple"):
+        return "🍎 מכשיר Apple" + (" (Apple TV/Mac)" if 7000 in p else "")
+    if has("samsung", "lg electronics", "lge", "sony", "tcl", "hisense", "vizio", "philips", "xiaomi tv") and \
+            ({8001, 8002, 3000, 7000, 9000} & p or "tv" in h):
+        return "📺 טלוויזיה חכמה"
+    if has("espressif", "tuya", "shelly", "itead", "sonoff", "broadlink", "yeelight", "lumi", "aqara", "tasmota",
+           "esphome", "switchbot", "meross", "wiz") or {6053, 6668, 1883} & p:
+        return "💡 בית חכם (IoT)"
+    if has("amazon", "echo"):
+        return "🔊 Amazon Echo / Fire"
+    if has("raspberry"):
+        return "🍓 Raspberry Pi"
+    if has("proxmox server solutions") or (d.get("mac", "").lower().startswith("bc:24:11")):
+        return "📦 מכונה וירטואלית"
+    if {3389, 445, 139, 5357} & p or has("windows", "desktop-", "laptop-"):
+        return "💻 מחשב Windows"
+    if has("playstation", "nintendo", "xbox", "valve"):
+        return "🎮 קונסולה"
+    if has("tp-link", "tplink", "ubiquiti", "mikrotik", "netgear", "asus", "zyxel", "huawei", "d-link", "cisco",
+           "ruckus", "aruba", "tenda", "mercusys", "router", "access point", "deco"):
+        return "📡 ציוד רשת"
+    if has("samsung", "xiaomi", "oneplus", "oppo", "vivo", "realme", "motorola", "huawei device", "honor"):
+        return "📱 טלפון / טאבלט"
+    if mac_random(d.get("mac", "")):
+        return "📱 טלפון/טאבלט (MAC פרטי)"
+    if 22 in p:
+        return "🐧 מכשיר לינוקס"
+    return "❓ לא מזוהה"
+
+
+async def port_open(ip, port, timeout=0.8):
+    try:
+        _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+        w.close()
+        return True
+    except Exception:
+        return False
+
+
+async def http_hint(ip, ports):
+    for port, scheme in ((80, "http"), (443, "https"), (8080, "http"), (8443, "https"), (5000, "http")):
+        if port not in ports:
+            continue
+        try:
+            async with aiohttp.ClientSession() as s:
+                async with s.get(f"{scheme}://{ip}:{port}/", ssl=False, allow_redirects=True,
+                                 timeout=aiohttp.ClientTimeout(total=4)) as r:
+                    body = (await r.content.read(30000)).decode("utf-8", "ignore")
+                    m = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
+                    return (m.group(1).strip()[:60] if m else ""), r.headers.get("Server", "")[:40]
+        except Exception:
+            continue
+    return "", ""
+
+
+async def probe(ip, mac, vendor):
+    ports = [p for p, ok in zip(NET_PORTS, await asyncio.gather(*(port_open(ip, p) for p in NET_PORTS))) if ok]
+    try:
+        hostname = (await asyncio.wait_for(asyncio.to_thread(socket.gethostbyaddr, ip), 3))[0]
+    except Exception:
+        hostname = ""
+    title, server = await http_hint(ip, ports)
+    d = {"ip": ip, "mac": mac, "vendor": vendor, "ports": ports, "hostname": hostname,
+         "title": title, "server": server}
+    d["type"] = guess_type(d)
+    return d
+
+
+async def arp_scan():
+    proc = await asyncio.create_subprocess_exec(
+        "arp-scan", "--localnet", "--plain", "--retry=2", "--interface", CFG.get("net_iface", "eth0"),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    out, err = await asyncio.wait_for(proc.communicate(), 60)
+    if proc.returncode != 0:
+        raise RuntimeError(err.decode()[:200])
+    res = {}
+    for line in out.decode("utf-8", "ignore").splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 2 and re.match(r"\d+\.\d+\.\d+\.\d+$", parts[0]):
+            res[parts[1].lower()] = (parts[0], parts[2].strip() if len(parts) > 2 else "")
+    return res
+
+
+def dev_name(d):
+    return d.get("name") or d.get("hostname") or d.get("title") or d.get("vendor") or d.get("mac")
+
+
+def dev_text(d, full=True):
+    st = {"new": "🆕 חדש", "known": "✅ מוכר", "flagged": "⚠️ חשוד"}.get(d.get("status"), "")
+    online = time.time() - d.get("last", 0) < 600
+    lines = [f"{d.get('type', '❓')} — {dev_name(d)}",
+             f"{'🟢 מחובר' if online else '⚪ לא מחובר'} · {st}",
+             f"🌐 {d.get('ip')} · 🔖 {d.get('mac')}"]
+    if full:
+        if d.get("vendor"):
+            lines.append(f"🏭 יצרן: {d['vendor']}")
+        if d.get("hostname"):
+            lines.append(f"🏷 שם ברשת: {d['hostname']}")
+        if d.get("title") or d.get("server"):
+            lines.append(f"🖥 דף ניהול: {d.get('title') or ''} {('(' + d['server'] + ')') if d.get('server') else ''}")
+        if d.get("ports"):
+            lines.append("🔌 פורטים: " + ", ".join(f"{p}/{PORT_NAMES.get(p, '?')}" for p in d["ports"]))
+        if mac_random(d.get("mac", "")):
+            lines.append("🔒 כתובת MAC אקראית (פרטיות של טלפון) — היצרן מוסתר")
+        lines.append(f"📅 נראה לראשונה: {time.strftime('%d/%m %H:%M', time.localtime(d.get('first', 0)))}"
+                     f" · אחרון: {time.strftime('%d/%m %H:%M', time.localtime(d.get('last', 0)))}")
+    return "\n".join(lines)
+
+
+def dev_buttons(mac):
+    k = mac.replace(":", "")
+    return [[Button.inline("✏️ תן שם", f"nn:{k}".encode()), Button.inline("✅ מוכר", f"nk:{k}".encode()),
+             Button.inline("⚠️ חשוד", f"nf:{k}".encode())],
+            [Button.inline("🔄 זיהוי מחדש", f"nr:{k}".encode()), Button.inline("🗑 שכח", f"nx:{k}".encode()),
+             Button.inline("⬅️ רשת", b"m:net:0")]]
+
+
+def mac_from_key(k):
+    return ":".join(k[i:i + 2] for i in range(0, 12, 2))
+
+
+async def net_scan_once(alert=True):
+    devs = STATE.setdefault("devices", {})
+    found = await arp_scan()
+    now = time.time()
+    new = []
+    for mac, (ip, vendor) in found.items():
+        d = devs.get(mac)
+        if d is None:
+            d = await probe(ip, mac, vendor)
+            d.update(first=now, last=now, status="new" if STATE.get("net_baselined") else "known")
+            devs[mac] = d
+            new.append(d)
+        else:
+            if d.get("ip") != ip:
+                d["ip"] = ip
+            if d.get("status") == "flagged" and now - d.get("last", 0) > 900 and alert:
+                await notify("⚠️ מכשיר שסימנת כחשוד חזר לרשת:\n\n" + dev_text(d, False), buttons=dev_buttons(mac))
+            d["last"] = now
+    persist()
+    if not STATE.get("net_baselined"):
+        STATE["net_baselined"] = True
+        persist()
+        types = {}
+        for d in devs.values():
+            types[d["type"]] = types.get(d["type"], 0) + 1
+        summary = "\n".join(f"{t}: {n}" for t, n in sorted(types.items(), key=lambda x: -x[1]))
+        await notify(f"🌐 סריקת רשת ראשונה הושלמה — נמצאו {len(devs)} מכשירים:\n\n{summary}\n\n"
+                     f"מעכשיו כל מכשיר חדש יקפיץ התראה.", buttons=[[Button.inline("📋 לרשימה", b"m:net:0")]])
+    elif alert:
+        for d in new:
+            await notify("🆕 מכשיר חדש התחבר לרשת!\n\n" + dev_text(d), buttons=dev_buttons(d["mac"]))
+    return len(found), len(new)
+
+
+async def net_monitor():
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await net_scan_once()
+        except Exception as e:
+            log.warning("net scan: %s", e)
+        await asyncio.sleep(int(CFG.get("net_interval", 180)))
+
+
+def net_view(page=0):
+    devs = list(STATE.get("devices", {}).values())
+    now = time.time()
+    devs.sort(key=lambda d: (now - d.get("last", 0) > 600, d.get("type", ""), dev_name(d).lower()))
+    online = sum(1 for d in devs if now - d.get("last", 0) < 600)
+    per = 14
+    chunk = devs[page * per:(page + 1) * per]
+    lines = [f"🌐 רשת ביתית — {online} מחוברים מתוך {len(devs)} מוכרים", ""]
+    rows = []
+    for d in chunk:
+        on = "🟢" if now - d.get("last", 0) < 600 else "⚪"
+        flag = " 🆕" if d.get("status") == "new" else (" ⚠️" if d.get("status") == "flagged" else "")
+        lines.append(f"{on} {d['type'].split(' ')[0]} {dev_name(d)[:28]} · {d.get('ip')}{flag}")
+        rows.append(Button.inline(f"{d['type'].split(' ')[0]} {dev_name(d)[:22]}", f"nd:{d['mac'].replace(':', '')}".encode()))
+    rows = [rows[i:i + 2] for i in range(0, len(rows), 2)]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ הקודם", f"m:net:{page - 1}".encode()))
+    if (page + 1) * per < len(devs):
+        nav.append(Button.inline("הבא ➡️", f"m:net:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("🔍 סרוק עכשיו", b"m:scan"), Button.inline("⬅️ תפריט", b"m:main")])
+    return "\n".join(lines), rows
+
+
+PENDING = {}
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
         [Button.inline("🎬 מדיה", b"m:media"), Button.inline("🖥 שרת", b"m:srv")],
         [Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
         [Button.inline("🧲 טורנטים", b"m:tor"), Button.inline("📊 הורדות", b"m:st")],
-        [Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
+        [Button.inline("🌐 רשת ביתית", b"m:net:0"), Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
     ])
 
 
@@ -768,6 +1098,29 @@ async def bot_text(event):
     text = (event.raw_text or "").strip()
     cmd, _, arg = text.partition(" ")
     cmd = cmd.lower().split("@")[0]
+    if PENDING.get("rename") and text and not text.startswith("/"):
+        mac = PENDING.pop("rename")
+        d = STATE.get("devices", {}).get(mac)
+        if d:
+            d["name"] = text[:40]
+            d["status"] = "known"
+            persist()
+            await event.respond("✏️ נשמר.\n\n" + dev_text(d), buttons=dev_buttons(mac))
+        return
+    PENDING.pop("rename", None)
+    if YT_RE.search(text) and not cmd.startswith("/"):
+        url = YT_RE.search(text).group(0)
+        STATE["seq"] = STATE.get("seq", 0) + 1
+        k = str(STATE["seq"])
+        YT_PENDING[k] = url
+        kind = "פלייליסט" if "list=" in url or "/playlist" in url or "/@" in url else "סרטון"
+        await event.respond(f"▶️ {kind} מיוטיוב — לאן להוריד?", buttons=[[
+            Button.inline("📺 YouTube", f"yt:{k}:y".encode()), Button.inline("🧸 YouTube ילדים", f"yt:{k}:k".encode())],
+            [Button.inline("❌ ביטול", f"yt:{k}:x".encode())]])
+        return
+    if cmd == "/network":
+        t, b = net_view(0); await event.respond(t, buttons=b)
+        return
     if cmd in ("/start", "/menu", "/help"):
         t, b = main_menu()
         await event.respond(t, buttons=b)
@@ -837,6 +1190,53 @@ async def bot_callback(event):
         t, b = await server_view(); await edit(t, buttons=b)
     elif data == "m:src":
         t, b = sources_view(); await edit(t, buttons=b)
+    elif parts[0] == "m" and parts[1] == "net":
+        t, b = net_view(int(parts[2])); await edit(t, buttons=b)
+    elif data == "m:scan":
+        await event.answer("🔍 סורק…")
+        try:
+            n, new = await net_scan_once()
+        except Exception as e:
+            await event.answer(f"❌ {e}"[:190], alert=True)
+            return
+        t, b = net_view(0); await edit(f"✔️ נסרקו {n} מכשירים ({new} חדשים)\n\n" + t, buttons=b)
+        return
+    elif parts[0] in ("nd", "nk", "nf", "nn", "nr", "nx"):
+        mac = mac_from_key(parts[1])
+        devs = STATE.get("devices", {})
+        d = devs.get(mac)
+        if not d:
+            await event.answer("המכשיר לא נמצא", alert=True)
+            return
+        if parts[0] == "nk":
+            d["status"] = "known"; persist(); await event.answer("✅ סומן כמוכר")
+        elif parts[0] == "nf":
+            d["status"] = "flagged"; persist(); await event.answer("⚠️ סומן כחשוד — אתריע כשיחזור לרשת", alert=True)
+        elif parts[0] == "nn":
+            PENDING["rename"] = mac
+            await event.answer()
+            await event.respond(f"✏️ שלח עכשיו שם ל: {dev_name(d)}")
+            return
+        elif parts[0] == "nr":
+            await event.answer("🔄 מזהה מחדש…")
+            nd = await probe(d["ip"], mac, d.get("vendor", ""))
+            for k2 in ("ports", "hostname", "title", "server", "type"):
+                d[k2] = nd[k2]
+            persist()
+        elif parts[0] == "nx":
+            devs.pop(mac, None); persist(); await event.answer("🗑 נשכח")
+            t, b = net_view(0); await edit(t, buttons=b)
+            return
+        await edit(dev_text(d), buttons=dev_buttons(mac))
+        return
+    elif parts[0] == "yt":
+        url = YT_PENDING.pop(parts[1], None)
+        if parts[2] == "x" or not url:
+            await edit("❌ בוטל" if parts[2] == "x" else "⚠️ הבקשה פגה — שלח את הקישור שוב")
+            return
+        await edit(f"⏳ נוסף לתור YouTube ({'ילדים' if parts[2] == 'k' else 'כללי'})\n{url}")
+        asyncio.create_task(yt_job(url, parts[2] == "k"))
+        return
     elif data == "m:tor":
         t, b = await torrents_view(); await edit(t, buttons=b)
     elif parts[0] in ("tp", "tr"):
@@ -977,6 +1377,7 @@ async def run():
                 BotCommand("add", "➕ הוספת מקור"),
                 BotCommand("sources", "📋 מקורות"),
                 BotCommand("torrents", "🧲 טורנטים"),
+                BotCommand("network", "🌐 רשת ביתית"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
             owner_only = lambda e: e.sender_id == OWNER_ID
@@ -1006,6 +1407,8 @@ async def run():
 
     QUEUE = asyncio.Queue()
     asyncio.create_task(tor_monitor())
+    if CFG.get("net_enabled", True):
+        asyncio.create_task(net_monitor())
     for i in range(int(CFG.get("workers", 2))):
         asyncio.create_task(worker(i))
 

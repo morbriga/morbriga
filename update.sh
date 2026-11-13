@@ -18,6 +18,13 @@ pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requiremen
 pct exec "$CTID" -- mv /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
 echo "code updated"
 
+if ! pct exec "$CTID" -- bash -c "command -v ffmpeg && command -v arp-scan" >/dev/null 2>&1; then
+  say "Installing ffmpeg (YouTube) and arp-scan (network scanner)"
+  pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ffmpeg arp-scan >/dev/null"
+fi
+pct exec "$CTID" -- ln -sf /usr/share/zoneinfo/Asia/Jerusalem /etc/localtime
+pct exec "$CTID" -- mkdir -p "/media/video/YouTube/ילדים"
+
 if ! pct exec "$CTID" -- test -f /etc/systemd/system/qbittorrent.service; then
   say "Installing qBittorrent (localhost only, controlled by the bot)"
   pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qbittorrent-nox >/dev/null"

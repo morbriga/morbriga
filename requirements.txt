@@ -2,3 +2,4 @@ telethon>=1.36
 cryptg
 guessit>=3.8
 aiohttp>=3.9
+yt-dlp

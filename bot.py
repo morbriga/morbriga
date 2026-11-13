@@ -1318,6 +1318,8 @@ async def lib_plan():
                 lines.append(f"↪️ {a[1]}: מוציא את {a[2].rsplit('/', 1)[1]}")
             elif a[0] == "delete":
                 lines.append(f"🗑 ספרייה ריקה תוסר: {a[1]} (הקבצים לא נמחקים)")
+        lines.append("\n⚠️ שים לב: תיקייה שעוברת לספרייה אחרת נסרקת מחדש — שמות ותמונות שתיקנת בה ידנית יתאפסו "
+                     "(אפשר לשחזר עם /restore).")
     else:
         lines.append("\n✔️ הכל כבר מסודר — אין מה לשנות.")
     return actions, "\n".join(lines), libs
@@ -1350,6 +1352,108 @@ async def lib_apply(actions, libs):
         if a[0] == "delete":
             await jf("DELETE", "/Library/VirtualFolders", params={"name": a[1], "refreshLibrary": "false"})
     await jellyfin_refresh()
+
+
+# ----------------------------------------------------------------- restore manual fixes from chat history
+async def jf_protect_libraries():
+    """Make Jellyfin save names/images next to the files (NFO + artwork) so they survive library changes."""
+    libs = await jf("GET", "/Library/VirtualFolders")
+    n = 0
+    for lib in libs:
+        opts = dict(lib.get("LibraryOptions") or {})
+        if not lib.get("ItemId"):
+            continue
+        opts["SaveLocalMetadata"] = True
+        savers = set(opts.get("MetadataSavers") or [])
+        savers.add("Nfo")
+        opts["MetadataSavers"] = sorted(savers)
+        await jf("POST", "/Library/VirtualFolders/LibraryOptions", body={"Id": lib["ItemId"], "LibraryOptions": opts})
+        n += 1
+    return n
+
+
+async def collect_fixes():
+    """Walk the control-bot chat (from the user's side) and rebuild {(folder, file): {name, img_msg, img_url}}."""
+    msgs = []
+    async for m in USER.iter_messages(BOT_ID, limit=5000):
+        msgs.append(m)
+    msgs.reverse()
+    fixes = {}
+    want, pending = None, None
+    for m in msgs:
+        txt = m.message or ""
+        from_bot = not m.out
+        if from_bot and txt.startswith("✏️ שלח את השם החדש"):
+            want, pending = "name", None
+            continue
+        if from_bot and txt.startswith("🖼 שלח תמונה"):
+            want, pending = "img", None
+            continue
+        if not from_bot and want:
+            if want == "name" and txt and not txt.startswith("/"):
+                pending = ("name", txt.strip()[:120])
+            elif want == "img":
+                if m.photo:
+                    pending = ("img_msg", m)
+                else:
+                    u = re.search(r"https?://\S+", txt)
+                    if u:
+                        pending = ("img_url", u.group(0))
+            want = None
+            continue
+        if from_bot and pending and (txt.startswith("✏️ השם עודכן") or txt.startswith("🖼 התמונה עודכנה")):
+            pm = re.search(r"📁 (.+)", txt)
+            if pm and "/" in pm.group(1):
+                folder, fname = pm.group(1).strip().rsplit("/", 1)
+                rec = fixes.setdefault((folder, fname), {})
+                kind, val = pending
+                if kind == "name":
+                    rec["name"] = val
+                else:
+                    rec.pop("img_msg", None)
+                    rec.pop("img_url", None)
+                    rec[kind] = val
+            pending = None
+    return fixes
+
+
+async def restore_fixes(progress=None):
+    fixes = await collect_fixes()
+    if not fixes:
+        return "לא נמצאו תיקונים בהיסטוריה."
+    res = await jf("GET", "/Items", params={"Recursive": "true", "Fields": "Path",
+                                            "IncludeItemTypes": "Movie,Series,Video,Episode"})
+    index = {}
+    for it in res.get("Items", []):
+        p = it.get("Path") or ""
+        if p:
+            index[(Path(p).parent.name, Path(p).name)] = it["Id"]
+    ok_n, ok_i, missing, errors = 0, 0, [], []
+    for (folder, fname), rec in fixes.items():
+        item_id = index.get((folder, fname))
+        if not item_id:
+            missing.append(rec.get("name") or fname)
+            continue
+        try:
+            if rec.get("name"):
+                await jf_rename(item_id, rec["name"])
+                ok_n += 1
+            if rec.get("img_msg"):
+                await jf_upload_image(item_id, await USER.download_media(rec["img_msg"], bytes))
+                ok_i += 1
+            elif rec.get("img_url"):
+                await jf_image(item_id, rec["img_url"])
+                ok_i += 1
+        except Exception as e:
+            errors.append(f"{rec.get('name') or fname}: {e}"[:80])
+    lines = [f"♻️ שוחזרו {ok_n} שמות ו-{ok_i} תמונות (מתוך {len(fixes)} פריטים שתיקנת)."]
+    if missing:
+        lines.append(f"\n⏳ לא נמצאו עדיין בג'ליפין ({len(missing)}) — כנראה הסריקה עוד רצה, הרץ /restore שוב בעוד כמה דקות:")
+        lines += [f"• {x}" for x in missing[:15]]
+    if errors:
+        lines.append("\n❌ שגיאות:")
+        lines += errors[:10]
+    return "\n".join(lines)
 
 
 # ----------------------------------------------------------------- bot UI
@@ -1458,6 +1562,16 @@ async def bot_text(event):
                 await event.respond(f"❌ {e}"[:300])
             return
         PENDING.pop(key, None)
+    if cmd == "/restore":
+        msg = await event.respond("♻️ קורא את היסטוריית התיקונים ומשחזר… (יכול לקחת דקה)")
+        try:
+            prot = await jf_protect_libraries()
+            out = await restore_fixes()
+            out += f"\n\n🛡 מעכשיו ג'ליפין שומר שמות ותמונות ליד הקבצים ב-{prot} ספריות — הם ישרדו שינויי ספריות."
+        except Exception as e:
+            out = f"❌ {e}"[:400]
+        await msg.edit(out)
+        return
     if cmd == "/libraries":
         actions, txt, libs = await lib_plan()
         LIB_PLAN["p"] = (actions, libs)
@@ -1805,6 +1919,7 @@ async def run():
                 BotCommand("network", "🌐 רשת ביתית"),
                 BotCommand("fix", "🔧 תיקון שם/תמונה בג'ליפין"),
                 BotCommand("libraries", "🗂 סידור ספריות ג'ליפין"),
+                BotCommand("restore", "♻️ שחזור שמות ותמונות שתיקנתי"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
             owner_only = lambda e: e.sender_id == OWNER_ID

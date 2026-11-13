@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import io
 import shutil
 import socket
 import time
@@ -143,6 +144,7 @@ def classify(filename, caption=""):
     stem = Path(filename).stem if filename else ""
     # if no usable filename, use first caption line
     source = stem if stem and not re.fullmatch(r"(video|file|movie)?[_\- ]?\d*", stem, re.I) else caption.split("\n")[0]
+    source = clean_title(source) or source
     g = {}
     try:
         g = dict(guessit(source or "Unknown"))
@@ -375,6 +377,7 @@ async def process(msg, origin):
                            "season": info["season"], "episode": info["episode"], "ext": info["ext"]}
     STATE["recent"].append(f"{time.strftime('%d/%m %H:%M')} {rel}")
     persist()
+    asyncio.create_task(jf_after_download(dest))
     text = f"✅ נשמר: {info['title']}\n📁 {rel}\n⏱ {mins:.1f} דק' · {size_text(size)}\n\nקטגוריה לא נכונה? בחר:"
     if BOT and status and getattr(status, "sender_id", None) == BOT_ID:
         await notify(text, buttons=kind_buttons(rid, info["kind"]), edit=status)
@@ -641,6 +644,7 @@ async def tor_finish(t):
         return await notify(f"⚠️ הטורנט הסתיים אבל לא נמצאו בו קבצי וידאו: {tname}")
     if len(results) == 1:
         rid, info, dest = results[0]
+        asyncio.create_task(jf_after_download(dest))
         text = f"✅ נשמר: {info['title']}\n📁 {dest.relative_to(media_root())}\n\nקטגוריה לא נכונה? בחר:"
         btn = kind_buttons(rid, info["kind"])
     else:
@@ -1031,13 +1035,188 @@ def net_view(page=0):
 PENDING = {}
 
 
+# ----------------------------------------------------------------- Jellyfin identify / fix
+JUNK_HE = ["נתי מדיה", "סטאר מדיה", "סטארמדיה", "מדובב לעברית", "מדובב", "דיבוב", "תרגום מובנה", "כתוביות מובנות",
+           "כתוביות", "תרגום", "איכות גבוהה", "באיכות", "HD", "FHD", "מלא", "סרט מלא", "לצפייה ישירה", "להורדה",
+           "ערוץ", "קבוצת", "HebDub", "HebSub", "Heb Dub", "Heb Sub", "Hebrew"]
+
+
+def clean_title(s):
+    s = str(s or "")
+    s = re.sub(r"https?://\S+|t\.me/\S+|@\w+", " ", s)
+    for w in sorted(set(JUNK_HE + CFG.get("strip_words", []) + STATE.get("strip_words", [])), key=len, reverse=True):
+        s = re.sub(re.escape(w), " ", s, flags=re.I)
+    s = re.sub(r"[\U0001F000-\U0001FFFF☀-➿]", " ", s)   # emoji
+    s = re.sub(r"(?<!\d)[._]|[._](?!\d)", " ", s)
+    s = re.sub(r"[\-–|]+", " ", s)
+    s = re.sub(r"\b(1080p|720p|480p|2160p|4k|web[- ]?dl|webrip|bluray|brrip|hdrip|x26[45]|h26[45]|hevc|aac|dd5 1)\b", " ", s, flags=re.I)
+    s = re.sub(r"[\[\](){}]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+JF_CAND = {}
+
+
+async def jf(method, path, params=None, body=None, raw=False):
+    url = (CFG.get("jellyfin_url") or "").rstrip("/")
+    key = STATE.get("jellyfin_key")
+    if not url or not key:
+        raise RuntimeError("חסר מפתח ג'ליפין (/jellyfin KEY)")
+    hdr = {"Authorization": f'MediaBrowser Token="{key}"', "X-Emby-Token": key}
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, url + path, params=params, json=body, headers=hdr,
+                             timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status >= 400:
+                raise RuntimeError(f"Jellyfin HTTP {r.status}: {(await r.text())[:120]}")
+            if raw:
+                return await r.read()
+            if r.status == 204:
+                return None
+            return await r.json(content_type=None)
+
+
+async def jf_user():
+    if not STATE.get("jf_user"):
+        users = await jf("GET", "/Users")
+        admin = next((u for u in users if u.get("Policy", {}).get("IsAdministrator")), users[0])
+        STATE["jf_user"] = admin["Id"]
+        persist()
+    return STATE["jf_user"]
+
+
+async def jf_get(item_id):
+    uid = await jf_user()
+    return await jf("GET", f"/Users/{uid}/Items/{item_id}")
+
+
+async def jf_find_path(dest: Path):
+    items = await jf("GET", "/Items", params={"Recursive": "true", "SortBy": "DateCreated", "SortOrder": "Descending",
+                                              "Limit": "80", "Fields": "Path,ProductionYear",
+                                              "IncludeItemTypes": "Movie,Episode,Video"})
+    for it in items.get("Items", []):
+        p = it.get("Path") or ""
+        if Path(p).name == dest.name and Path(p).parent.name == dest.parent.name:
+            if it.get("Type") == "Episode" and it.get("SeriesId"):
+                return {"Id": it["SeriesId"], "Type": "Series", "Name": it.get("SeriesName")}
+            return it
+    return None
+
+
+async def jf_search(term):
+    res = await jf("GET", "/Items", params={"Recursive": "true", "SearchTerm": term, "Limit": "12",
+                                            "IncludeItemTypes": "Movie,Series,Video", "Fields": "ProductionYear,Path"})
+    return res.get("Items", [])
+
+
+def jf_type(item):
+    return "Series" if item.get("Type") == "Series" else "Movie"
+
+
+async def jf_panel(item_id, note=""):
+    it = await jf_get(item_id)
+    yr = f" ({it.get('ProductionYear')})" if it.get("ProductionYear") else ""
+    tm = (it.get("ProviderIds") or {}).get("Tmdb")
+    path = Path(it.get("Path") or "")
+    cap = (f"{note}\n" if note else "") + f"🎬 {it.get('Name')}{yr}\n📁 {path.parent.name}/{path.name}"[:300]
+    cap += f"\n🔗 TMDB {tm}" if tm else "\n⚠️ לא מזוהה ב-TMDB"
+    btn = [[Button.inline("✅ נכון", b"jok"), Button.inline("🔄 הצעות זיהוי", f"jr:{item_id}".encode())],
+           [Button.inline("🔎 חפש בשם", f"js:{item_id}".encode()), Button.inline("✏️ שנה שם", f"jn:{item_id}".encode())],
+           [Button.inline("🖼 תמונה מקישור", f"jp:{item_id}".encode())]]
+    img = None
+    try:
+        img = await jf("GET", f"/Items/{item_id}/Images/Primary", params={"maxHeight": "700"}, raw=True)
+    except Exception:
+        pass
+    return cap, btn, img
+
+
+async def jf_send_panel(item_id, note=""):
+    cap, btn, img = await jf_panel(item_id, note)
+    if img and BOT:
+        f = io.BytesIO(img)
+        f.name = "poster.jpg"
+        return await BOT.send_file(OWNER_ID, f, caption=cap, buttons=btn)
+    return await notify(cap, buttons=btn)
+
+
+async def jf_candidates(item_id, query=None):
+    it = await jf_get(item_id)
+    if query:
+        q, year = query, None
+    else:
+        g = classify(Path(it.get("Path") or "x").name, "")
+        q = clean_title(g["title"]) or clean_title(it.get("Name"))
+        year = g.get("year")
+    res = await jf("POST", f"/Items/RemoteSearch/{jf_type(it)}",
+                   body={"SearchInfo": {"Name": q, "Year": year}, "ItemId": item_id,
+                         "IncludeDisabledProviders": False})
+    if not res and year:
+        res = await jf("POST", f"/Items/RemoteSearch/{jf_type(it)}",
+                       body={"SearchInfo": {"Name": q}, "ItemId": item_id, "IncludeDisabledProviders": False})
+    STATE["seq"] = STATE.get("seq", 0) + 1
+    k = str(STATE["seq"])
+    JF_CAND[k] = (item_id, (res or [])[:8])
+    rows = [[Button.inline(f"{r.get('Name', '')[:30]} ({r.get('ProductionYear') or '?'})", f"ja:{k}:{i}".encode())]
+            for i, r in enumerate(JF_CAND[k][1])]
+    rows.append([Button.inline("🔎 חפש בשם אחר", f"js:{item_id}".encode()), Button.inline("❌ סגור", b"jok")])
+    txt = f"🔄 חיפוש: \"{q}\"" + (f" ({year})" if year else "") + ("\nבחר את הנכון:" if res else "\nלא נמצאו תוצאות — נסה חיפוש בשם אחר (גם באנגלית).")
+    return txt, rows
+
+
+async def jf_apply(k, i):
+    item_id, res = JF_CAND.get(k, (None, []))
+    if not item_id or i >= len(res):
+        raise RuntimeError("הבחירה פגה — נסה שוב")
+    await jf("POST", f"/Items/RemoteSearch/Apply/{item_id}", params={"ReplaceAllImages": "true"}, body=res[i])
+    return item_id
+
+
+async def jf_rename(item_id, name):
+    it = await jf_get(item_id)
+    it["Name"] = name
+    locked = set(it.get("LockedFields") or [])
+    locked.add("Name")
+    it["LockedFields"] = sorted(locked)
+    await jf("POST", f"/Items/{item_id}", body=it)
+
+
+async def jf_image(item_id, url):
+    await jf("POST", f"/Items/{item_id}/RemoteImages/Download", params={"type": "Primary", "imageUrl": url})
+
+
+async def jf_after_download(dest: Path, delay=150):
+    """Wait for Jellyfin to scan the new file, then show what it matched with fix buttons."""
+    if not STATE.get("jellyfin_key") or not CFG.get("identify_after_download", True):
+        return
+    await asyncio.sleep(delay)
+    for _ in range(4):
+        try:
+            it = await jf_find_path(dest)
+            if it:
+                await jf_send_panel(it["Id"], "🔍 ג'ליפין זיהה את ההורדה כך:")
+                return
+        except Exception as e:
+            log.warning("jf identify: %s", e)
+        await asyncio.sleep(90)
+
+
+async def jf_menu_find(term):
+    items = await jf_search(term)
+    if not items:
+        return f"לא נמצא בג'ליפין: {term}\nנסה מילה אחרת מהשם שמופיע במסך.", None
+    rows = [[Button.inline(f"{it.get('Name', '')[:30]} ({it.get('ProductionYear') or '?'})", f"ji:{it['Id']}".encode())]
+            for it in items]
+    return f"🔧 בחר פריט לתיקון ({len(items)}):", rows
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
         [Button.inline("🎬 מדיה", b"m:media"), Button.inline("🖥 שרת", b"m:srv")],
         [Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
         [Button.inline("🧲 טורנטים", b"m:tor"), Button.inline("📊 הורדות", b"m:st")],
-        [Button.inline("🌐 רשת ביתית", b"m:net:0"), Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
+        [Button.inline("🌐 רשת ביתית", b"m:net:0"), Button.inline("🔧 תיקון ג'ליפין", b"m:fix")],
+        [Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
     ])
 
 
@@ -1108,6 +1287,33 @@ async def bot_text(event):
             await event.respond("✏️ נשמר.\n\n" + dev_text(d), buttons=dev_buttons(mac))
         return
     PENDING.pop("rename", None)
+    for key in ("jfind", "jsearch", "jname", "jimg"):
+        if PENDING.get(key) and text and not text.startswith("/"):
+            arg_id = PENDING.pop(key)
+            try:
+                if key == "jfind":
+                    t, b = await jf_menu_find(text); await event.respond(t, buttons=b)
+                elif key == "jsearch":
+                    t, b = await jf_candidates(arg_id, text); await event.respond(t, buttons=b)
+                elif key == "jname":
+                    await jf_rename(arg_id, text[:120]); await jf_send_panel(arg_id, "✏️ השם עודכן:")
+                elif key == "jimg":
+                    url = re.search(r"https?://\S+", text)
+                    if not url:
+                        await event.respond("⚠️ זה לא קישור. שלח קישור לתמונה (מתחיל ב-http)")
+                        return
+                    await jf_image(arg_id, url.group(0)); await jf_send_panel(arg_id, "🖼 התמונה עודכנה:")
+            except Exception as e:
+                await event.respond(f"❌ {e}"[:300])
+            return
+        PENDING.pop(key, None)
+    if cmd == "/fix":
+        if arg.strip():
+            t, b = await jf_menu_find(arg.strip()); await event.respond(t, buttons=b)
+        else:
+            PENDING["jfind"] = 1
+            await event.respond("🔧 איזה סרט/סדרה לתקן? שלח מילה מהשם כפי שהוא מופיע בג'ליפין")
+        return
     if YT_RE.search(text) and not cmd.startswith("/"):
         url = YT_RE.search(text).group(0)
         STATE["seq"] = STATE.get("seq", 0) + 1
@@ -1190,6 +1396,44 @@ async def bot_callback(event):
         t, b = await server_view(); await edit(t, buttons=b)
     elif data == "m:src":
         t, b = sources_view(); await edit(t, buttons=b)
+    elif data == "m:fix":
+        PENDING["jfind"] = 1
+        await event.answer()
+        await event.respond("🔧 איזה סרט/סדרה לתקן? שלח מילה מהשם כפי שהוא מופיע בג'ליפין")
+        return
+    elif data == "jok":
+        await event.answer("👍")
+        try:
+            await edit(buttons=None)
+        except Exception:
+            pass
+        return
+    elif parts[0] == "ji":
+        await event.answer()
+        await jf_send_panel(parts[1])
+        return
+    elif parts[0] == "jr":
+        await event.answer("🔄 מחפש…")
+        t, b = await jf_candidates(parts[1]); await event.respond(t, buttons=b)
+        return
+    elif parts[0] in ("js", "jn", "jp"):
+        key = {"js": "jsearch", "jn": "jname", "jp": "jimg"}[parts[0]]
+        PENDING[key] = parts[1]
+        await event.answer()
+        await event.respond({"js": "🔎 שלח שם לחיפוש (עברית או אנגלית, אפשר עם שנה)",
+                             "jn": "✏️ שלח את השם החדש",
+                             "jp": "🖼 שלח קישור לתמונה (פוסטר). אפשר: לחיצה ארוכה על תמונה בגוגל ← העתק כתובת תמונה"}[parts[0]])
+        return
+    elif parts[0] == "ja":
+        await event.answer("⏳ מעדכן…")
+        try:
+            item_id = await jf_apply(parts[1], int(parts[2]))
+            await edit("✅ הזיהוי עודכן", buttons=None)
+            await asyncio.sleep(4)
+            await jf_send_panel(item_id, "✅ עודכן:")
+        except Exception as e:
+            await event.respond(f"❌ {e}"[:300])
+        return
     elif parts[0] == "m" and parts[1] == "net":
         t, b = net_view(int(parts[2])); await edit(t, buttons=b)
     elif data == "m:scan":
@@ -1378,6 +1622,7 @@ async def run():
                 BotCommand("sources", "📋 מקורות"),
                 BotCommand("torrents", "🧲 טורנטים"),
                 BotCommand("network", "🌐 רשת ביתית"),
+                BotCommand("fix", "🔧 תיקון שם/תמונה בג'ליפין"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
             owner_only = lambda e: e.sender_id == OWNER_ID

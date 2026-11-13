@@ -37,7 +37,7 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-restore2"
+VERSION = "2026.11.13-gdrive3"
 CHANGES = "♻️ שחזור אוטומטי של כל השמות והתמונות שתיקנת מהצ'אט (רץ לבד, מנסה שוב עד שהכל נמצא)"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
@@ -1747,30 +1747,61 @@ def _dir_size(p):
     return sum(f.stat().st_size for f in Path(p).rglob("*") if f.is_file())
 
 
+async def gd_fetch(session, fid, dest: Path):
+    """Download one public Drive file straight from usercontent, with retries."""
+    for attempt in range(4):
+        try:
+            async with session.get("https://drive.usercontent.google.com/download",
+                                   params={"id": fid, "export": "download", "confirm": "t"},
+                                   timeout=aiohttp.ClientTimeout(total=None, sock_read=300)) as r:
+                ctype = r.headers.get("Content-Type", "")
+                if r.status == 200 and "text/html" not in ctype:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    with open(dest, "wb") as f:
+                        async for chunk in r.content.iter_chunked(1 << 20):
+                            f.write(chunk)
+                    return True
+        except Exception as e:
+            log.warning("gd fetch %s: %s", fid, e)
+        await asyncio.sleep(3 * (attempt + 1))
+    return False
+
+
 async def gdrive_job(url, dest_kind):
     import gdown
-    status = await notify("☁️ גוגל דרייב: מתחיל הורדה…")
+    status = await notify("☁️ גוגל דרייב: קורא את רשימת הקבצים…")
     work = TMP / f"gd_{int(time.time())}"
     work.mkdir(parents=True, exist_ok=True)
     is_folder = "/folders/" in url
     try:
-        def run():
-            if is_folder:
-                return gdown.download_folder(url, output=str(work), quiet=True, use_cookies=False, retries=3)
+        if is_folder:
+            listing = await asyncio.to_thread(gdown.download_folder, url, output=str(work), quiet=True,
+                                              use_cookies=False, skip_download=True)
+            if not listing:
+                raise RuntimeError("לא הצלחתי לקרוא את התיקייה — ודא שהיא משותפת ל'כל מי שיש לו את הקישור'")
+            todo = [(f.id, Path(f.local_path)) for f in listing
+                    if Path(f.local_path).suffix.lower() in MEDIA_KEEP]
+        else:
             m = re.search(r"/d/([\w-]+)|[?&]id=([\w-]+)", url)
-            fid = (m.group(1) or m.group(2)) if m else None
-            return gdown.download(id=fid, url=None if fid else url, output=str(work) + "/", quiet=True,
-                                  use_cookies=False, retries=3)
-        task = asyncio.create_task(asyncio.to_thread(run))
-        while not task.done():
-            await asyncio.sleep(8)
-            try:
-                await status.edit(f"☁️ גוגל דרייב: {'תיקייה' if is_folder else 'קובץ'}\n⬇️ {fmt_bytes(_dir_size(work))}")
-            except Exception:
-                pass
-        res = task.result()
-        if not res:
-            raise RuntimeError("ההורדה נכשלה — ודא שהקישור משותף ל'כל מי שיש לו את הקישור'")
+            if not m:
+                raise RuntimeError("לא זיהיתי מזהה קובץ בקישור")
+            todo = [(m.group(1) or m.group(2), work / "file")]
+        failed = []
+        async with aiohttp.ClientSession() as session:
+            for i, (fid, dest) in enumerate(todo, 1):
+                ok = await gd_fetch(session, fid, dest)
+                if not ok:
+                    failed.append(dest.name)
+                if status and (i % 5 == 0 or i == len(todo)):
+                    try:
+                        await status.edit(f"☁️ גוגל דרייב: {i}/{len(todo)} קבצים · {fmt_bytes(_dir_size(work))}"
+                                          + (f" · ❌ {len(failed)}" if failed else ""))
+                    except Exception:
+                        pass
+                await asyncio.sleep(0.3)
+        if not is_folder and (work / "file").exists():
+            # name single files sensibly
+            (work / "file").rename(work / f"gdrive_{todo[0][0]}.mp4")
         files = [f for f in work.rglob("*") if f.is_file() and f.suffix.lower() in MEDIA_KEEP]
         if not files:
             raise RuntimeError("לא נמצאו סרטונים או תמונות בקישור")
@@ -1785,12 +1816,17 @@ async def gdrive_job(url, dest_kind):
                     continue
                 out = unique(target_path(classify(f.name, "")))
             else:
-                out = unique(root / f.name)
+                out = root / re.sub(r"^(עותק של |Copy of )", "", f.name)
+                if out.exists() and out.stat().st_size == f.stat().st_size:
+                    continue                      # already have it from a previous run
+                out = unique(out)
             out.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(shutil.move, str(f), out)
             moved += 1
         where = root.relative_to(media_root()) if root else "סרטים"
-        await notify(f"✅ גוגל דרייב: נשמרו {moved} קבצים\n📁 {where}", edit=status)
+        await notify(f"✅ גוגל דרייב: נשמרו {moved} קבצים\n📁 {where}" +
+                     (f"\n⚠️ {len(failed)} קבצים לא ירדו (גוגל חסם זמנית) — שלח את הקישור שוב בעוד שעה, "
+                      f"מה שכבר ירד לא יוכפל" if failed else ""), edit=status)
         if moved:
             schedule_refresh()
     except Exception as e:

@@ -150,6 +150,8 @@ def classify(filename, caption=""):
     title = g.get("title") or source or "Unknown"
     if isinstance(title, list):
         title = " ".join(map(str, title))
+    if g.get("part") and not isinstance(g.get("part"), list):
+        title = f"{title} Part {g['part']}"
     year = g.get("year")
     season = g.get("season")
     episode = g.get("episode")
@@ -502,12 +504,210 @@ async def vm_view(node, typ, vmid):
 ACT_HE = {"start": "הפעלה", "shutdown": "כיבוי", "reboot": "ריסטרט", "stop": "כיבוי כפוי"}
 
 
+# ----------------------------------------------------------------- torrents (qBittorrent on localhost)
+QBT = os.environ.get("QBT_URL", "http://127.0.0.1:8080")
+TOR_DONE_STATES = {"uploading", "stalledUP", "pausedUP", "stoppedUP", "queuedUP", "forcedUP", "checkingUP"}
+TOR_STATE_HE = {"downloading": "⬇️ מוריד", "stalledDL": "⏳ ממתין לשותפים", "metaDL": "🔎 מושך מידע",
+                "queuedDL": "🕒 בתור", "pausedDL": "⏸ מושהה", "stoppedDL": "⏸ מושהה", "checkingDL": "🔍 בודק",
+                "forcedDL": "⬇️ מוריד", "error": "❌ שגיאה", "missingFiles": "❌ קבצים חסרים", "moving": "📦 מעביר"}
+SUB_EXT = {".srt", ".ass", ".sub", ".vtt"}
+
+
+async def qbt(method, path, data=None, raw=False):
+    async with aiohttp.ClientSession() as s:
+        async with s.request(method, f"{QBT}/api/v2{path}", data=data,
+                             timeout=aiohttp.ClientTimeout(total=30)) as r:
+            if r.status >= 400:
+                raise RuntimeError(f"qBittorrent HTTP {r.status}: {(await r.text())[:100]}")
+            if raw:
+                return await r.text()
+            return await r.json(content_type=None)
+
+
+async def qbt_ok():
+    try:
+        await qbt("GET", "/app/version", raw=True)
+        return True
+    except Exception:
+        return False
+
+
+async def tor_add(magnet=None, file_bytes=None, file_name="file.torrent"):
+    STATE["seq"] = STATE.get("seq", 0) + 1
+    tag = f"tg{STATE['seq']}"
+    form = aiohttp.FormData()
+    form.add_field("tags", tag)
+    form.add_field("savepath", str(TOR_DIR()))
+    if magnet:
+        form.add_field("urls", magnet)
+    else:
+        form.add_field("torrents", file_bytes, filename=file_name, content_type="application/x-bittorrent")
+    res = await qbt("POST", "/torrents/add", data=form, raw=True)
+    if "fail" in res.lower():
+        raise RuntimeError("qBittorrent דחה את הטורנט (אולי כבר קיים?)")
+    for _ in range(15):
+        lst = await qbt("GET", f"/torrents/info?tag={tag}")
+        if lst:
+            t = lst[0]
+            msg = await notify(tor_text(t), buttons=tor_buttons(t))
+            STATE.setdefault("torrents", {})[t["hash"]] = {"msg": getattr(msg, "id", None), "tag": tag,
+                                                          "last": 0, "pct": -1}
+            persist()
+            return t
+        await asyncio.sleep(1)
+    raise RuntimeError("הטורנט נוסף אבל לא הופיע ברשימה")
+
+
+def TOR_DIR():
+    return media_root() / ".downloads"
+
+
+def tor_text(t):
+    pct = int(t.get("progress", 0) * 100)
+    bar = "▓" * (pct // 10) + "░" * (10 - pct // 10)
+    st = TOR_STATE_HE.get(t.get("state"), t.get("state"))
+    eta = t.get("eta", 8640000)
+    eta_txt = "" if eta >= 8640000 else f" · נותרו {fmt_up(eta)}"
+    return (f"🧲 {t.get('name', '')[:80]}\n{st} · {fmt_bytes(t.get('size'))}\n{bar} {pct}%\n"
+            f"⚡ {fmt_bytes(t.get('dlspeed'))}/s · 👥 {t.get('num_seeds', 0)} מקורות{eta_txt}")
+
+
+def tor_buttons(t, named=False):
+    h = t["hash"]
+    paused = t.get("state") in ("pausedDL", "stoppedDL")
+    n = f" {t.get('name', '')[:18]}" if named else ""
+    return [[Button.inline(("▶️ המשך" if paused else "⏸ השהה") + n, f"{'tr' if paused else 'tp'}:{h}".encode()),
+             Button.inline("🗑 ביטול" + n, f"td:{h}".encode())]]
+
+
+async def tor_pause(h, resume=False):
+    for ep in (("resume", "start") if resume else ("pause", "stop")):
+        try:
+            await qbt("POST", f"/torrents/{ep}", data={"hashes": h}, raw=True)
+            return
+        except Exception:
+            continue
+
+
+async def tor_finish(t):
+    """Torrent complete: stop seeding, move video files into the library."""
+    h = t["hash"]
+    files = await qbt("GET", f"/torrents/files?hash={h}")
+    save = Path(t.get("save_path") or TOR_DIR())
+    await qbt("POST", "/torrents/delete", data={"hashes": h, "deleteFiles": "false"}, raw=True)
+    await asyncio.sleep(2)
+    paths = [save / f["name"] for f in files]
+    videos = [p for p in paths if p.suffix.lower() in VIDEO_EXT and p.exists()]
+    big = [p for p in videos if p.stat().st_size > 150 * 1024 ** 2 and "sample" not in p.name.lower()]
+    videos = big or videos
+    subs = [p for p in paths if p.suffix.lower() in SUB_EXT and p.exists()]
+    tname = t.get("name", "")
+    results = []
+    for v in videos:
+        if len(videos) == 1:
+            info = classify(tname + v.suffix, "")       # torrent name is usually the cleanest
+            vi = classify(v.name, tname)
+            if vi["kind"] == "series" or (vi.get("year") and not info.get("year")):
+                info = vi
+        else:
+            info = classify(v.name, tname)
+        dest = unique(target_path(info))
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(shutil.move, str(v), dest)
+        # subtitles: same stem, or all subs if single video
+        for i, s in enumerate(subs):
+            if len(videos) == 1 or s.stem.lower().startswith(v.stem.lower()):
+                lang = ".he" if HEB_RE.search(s.name) or re.search(r"heb|hebrew|\.he\b", s.name, re.I) else ""
+                sd = dest.with_name(f"{dest.stem}{lang}{'.' + str(i) if i and not lang else ''}{s.suffix.lower()}")
+                try:
+                    await asyncio.to_thread(shutil.move, str(s), unique(sd))
+                except Exception:
+                    pass
+        STATE["seq"] = STATE.get("seq", 0) + 1
+        rid = str(STATE["seq"])
+        STATE["saved"][rid] = {"path": str(dest), "kind": info["kind"], "title": info["title"], "year": info["year"],
+                               "season": info["season"], "episode": info["episode"], "ext": info["ext"]}
+        STATE["recent"].append(f"{time.strftime('%d/%m %H:%M')} {dest.relative_to(media_root())}")
+        results.append((rid, info, dest))
+    # clean leftovers (nfo, txt, samples, empty dirs)
+    top = save / Path(files[0]["name"]).parts[0] if files and len(Path(files[0]["name"]).parts) > 1 else None
+    if top and top.exists() and TOR_DIR() in top.parents:
+        await asyncio.to_thread(shutil.rmtree, top, True)
+    persist()
+    rec = STATE.get("torrents", {}).pop(h, {})
+    persist()
+    if not results:
+        return await notify(f"⚠️ הטורנט הסתיים אבל לא נמצאו בו קבצי וידאו: {tname}")
+    if len(results) == 1:
+        rid, info, dest = results[0]
+        text = f"✅ נשמר: {info['title']}\n📁 {dest.relative_to(media_root())}\n\nקטגוריה לא נכונה? בחר:"
+        btn = kind_buttons(rid, info["kind"])
+    else:
+        folders = sorted({str(d.parent.relative_to(media_root())) for _, _, d in results})
+        text = f"✅ נשמרו {len(results)} קבצים מ: {tname[:60]}\n📁 " + "\n📁 ".join(folders[:5])
+        btn = None
+    if rec.get("msg") and BOT:
+        try:
+            await BOT.edit_message(OWNER_ID, rec["msg"], text, buttons=btn)
+        except Exception:
+            await notify(text, buttons=btn)
+    else:
+        await notify(text, buttons=btn)
+    schedule_refresh()
+
+
+async def tor_monitor():
+    while True:
+        await asyncio.sleep(10)
+        tracked = STATE.get("torrents", {})
+        if not tracked:
+            continue
+        try:
+            lst = {t["hash"]: t for t in await qbt("GET", "/torrents/info")}
+        except Exception as e:
+            log.warning("qbt poll: %s", e)
+            continue
+        for h, rec in list(tracked.items()):
+            t = lst.get(h)
+            if not t:
+                tracked.pop(h, None)
+                persist()
+                continue
+            try:
+                if t.get("state") in TOR_DONE_STATES or t.get("progress", 0) >= 1:
+                    await tor_finish(t)
+                    continue
+                pct = int(t.get("progress", 0) * 100)
+                now = time.time()
+                if rec.get("msg") and BOT and (pct != rec.get("pct")) and now - rec.get("last", 0) > 20:
+                    rec.update(pct=pct, last=now)
+                    await BOT.edit_message(OWNER_ID, rec["msg"], tor_text(t), buttons=tor_buttons(t))
+            except Exception as e:
+                log.warning("torrent %s: %s", h, e)
+
+
+async def torrents_view():
+    if not await qbt_ok():
+        return "🧲 qBittorrent לא זמין (הרץ את פקודת העדכון)", [[Button.inline("⬅️ תפריט", b"m:main")]]
+    lst = await qbt("GET", "/torrents/info")
+    if not lst:
+        txt = "🧲 אין טורנטים פעילים.\nשלח לי קישור magnet או קובץ ‎.torrent כדי להתחיל."
+    else:
+        txt = "🧲 טורנטים:\n\n" + "\n\n".join(tor_text(t) for t in lst[:8])
+    rows = []
+    for t in lst[:8]:
+        rows += tor_buttons(t, named=len(lst) > 1)
+    rows.append([Button.inline("🔄 רענן", b"m:tor"), Button.inline("⬅️ תפריט", b"m:main")])
+    return txt, rows
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
         [Button.inline("🎬 מדיה", b"m:media"), Button.inline("🖥 שרת", b"m:srv")],
         [Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
-        [Button.inline("📊 הורדות", b"m:st"), Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
+        [Button.inline("🧲 טורנטים", b"m:tor"), Button.inline("📊 הורדות", b"m:st")],
+        [Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
     ])
 
 
@@ -573,6 +773,20 @@ async def bot_text(event):
         await event.respond(t, buttons=b)
     elif cmd == "/media":
         t, b = media_view(); await event.respond(t, buttons=b)
+    elif cmd == "/torrents":
+        t, b = await torrents_view(); await event.respond(t, buttons=b)
+    elif "magnet:?" in text:
+        for mg in re.findall(r"magnet:\?\S+", text):
+            try:
+                await tor_add(magnet=mg)
+            except Exception as e:
+                await event.respond(f"❌ {e}")
+    elif event.message.document and (file_name_of(event.message) or "").lower().endswith(".torrent"):
+        data = await event.message.download_media(bytes)
+        try:
+            await tor_add(file_bytes=data, file_name=file_name_of(event.message))
+        except Exception as e:
+            await event.respond(f"❌ {e}")
     elif cmd == "/server":
         t, b = await server_view(); await event.respond(t, buttons=b)
     elif cmd == "/sources":
@@ -623,6 +837,22 @@ async def bot_callback(event):
         t, b = await server_view(); await edit(t, buttons=b)
     elif data == "m:src":
         t, b = sources_view(); await edit(t, buttons=b)
+    elif data == "m:tor":
+        t, b = await torrents_view(); await edit(t, buttons=b)
+    elif parts[0] in ("tp", "tr"):
+        await tor_pause(parts[1], resume=parts[0] == "tr")
+        await event.answer("▶️ ממשיך" if parts[0] == "tr" else "⏸ הושהה")
+        STATE.get("torrents", {}).get(parts[1], {})["last"] = 0
+        return
+    elif parts[0] == "td":
+        await edit("🗑 לבטל את הטורנט ולמחוק את מה שירד?", buttons=[[
+            Button.inline("✅ כן, בטל", f"tx:{parts[1]}".encode()), Button.inline("❌ לא", b"m:tor")]])
+    elif parts[0] == "tx":
+        await qbt("POST", "/torrents/delete", data={"hashes": parts[1], "deleteFiles": "true"}, raw=True)
+        STATE.get("torrents", {}).pop(parts[1], None); persist()
+        await event.answer("🗑 בוטל")
+        t, b = await torrents_view(); await edit(t, buttons=b)
+        return
     elif data == "m:jf":
         await event.answer(f"רענון ג'ליפין: {await jellyfin_refresh()}", alert=True)
         return
@@ -746,6 +976,7 @@ async def run():
                 BotCommand("server", "🖥 מצב שרת ומכונות"),
                 BotCommand("add", "➕ הוספת מקור"),
                 BotCommand("sources", "📋 מקורות"),
+                BotCommand("torrents", "🧲 טורנטים"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
             owner_only = lambda e: e.sender_id == OWNER_ID
@@ -774,6 +1005,7 @@ async def run():
             await USER.send_message("me", f"⚠️ בוט השליטה לא עלה: {e}")
 
     QUEUE = asyncio.Queue()
+    asyncio.create_task(tor_monitor())
     for i in range(int(CFG.get("workers", 2))):
         asyncio.create_task(worker(i))
 

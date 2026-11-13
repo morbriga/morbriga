@@ -18,6 +18,47 @@ pct exec "$CTID" -- /opt/tgmedia/venv/bin/pip install -r /opt/tgmedia/requiremen
 pct exec "$CTID" -- mv /opt/tgmedia/bot.py.new /opt/tgmedia/bot.py
 echo "code updated"
 
+if ! pct exec "$CTID" -- test -f /etc/systemd/system/qbittorrent.service; then
+  say "Installing qBittorrent (localhost only, controlled by the bot)"
+  pct exec "$CTID" -- bash -c "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq qbittorrent-nox >/dev/null"
+  pct exec "$CTID" -- mkdir -p /opt/qbt/qBittorrent/config /media/video/.downloads
+  pct exec "$CTID" -- bash -c "cat > /opt/qbt/qBittorrent/config/qBittorrent.conf <<'EOF'
+[LegalNotice]
+Accepted=true
+
+[BitTorrent]
+Session\DefaultSavePath=/media/video/.downloads
+Session\QueueingSystemEnabled=true
+Session\MaxActiveDownloads=3
+Session\MaxActiveTorrents=5
+Session\GlobalMaxRatio=0
+
+[Preferences]
+Downloads\SavePath=/media/video/.downloads/
+WebUI\Address=127.0.0.1
+WebUI\Port=8080
+WebUI\LocalHostAuth=false
+WebUI\HostHeaderValidation=false
+WebUI\CSRFProtection=false
+EOF
+cat > /etc/systemd/system/qbittorrent.service <<'EOF'
+[Unit]
+Description=qBittorrent (headless)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/qbittorrent-nox --profile=/opt/qbt
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && systemctl enable --now qbittorrent"
+  sleep 4
+  pct exec "$CTID" -- curl -fsS http://127.0.0.1:8080/api/v2/app/version && echo "  ← qBittorrent OK"
+fi
+
 if ! pct exec "$CTID" -- grep -q '"pve_token"' /opt/tgmedia/config.json; then
   say "Creating limited Proxmox API user for the bot (view + start/stop only)"
   pveum role add TGBot -privs "VM.Audit,VM.PowerMgmt,Sys.Audit,Datastore.Audit" 2>/dev/null || \

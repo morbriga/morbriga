@@ -1199,7 +1199,8 @@ async def jf_libraries_view():
     for lib in libs:
         if lib.get("ItemId"):
             rows.append([Button.inline(f"📚 {lib.get('Name')}", f"jl:{lib['ItemId']}:0".encode())])
-    rows.append([Button.inline("🔎 חיפוש לפי שם", b"jq"), Button.inline("⬅️ תפריט", b"m:main")])
+    rows.append([Button.inline("🔎 חיפוש לפי שם", b"jq"), Button.inline("🗂 סידור ספריות", b"lb:plan")])
+    rows.append([Button.inline("⬅️ תפריט", b"m:main")])
     return "🔧 תיקון שמות ותמונות — בחר ספרייה:", rows
 
 
@@ -1247,6 +1248,108 @@ async def jf_menu_find(term):
     rows = [[Button.inline(f"{it.get('Name', '')[:30]} ({it.get('ProductionYear') or '?'})", f"ji:{it['Id']}".encode())]
             for it in items]
     return f"🔧 בחר פריט לתיקון ({len(items)}):", rows
+
+
+# ----------------------------------------------------------------- Jellyfin library layout
+LIB_LAYOUT = {  # top-level folder on the share -> (library name, collection type)
+    "סרטים": ("סרטים", "movies"),
+    "סרטים ישראלים": ("סרטים ישראלים", "movies"),
+    "ילדים": ("ילדים", "movies"),
+    "סדרות": ("סדרות", "tvshows"),
+    "טיולים": ("טיולים", "homevideos"),
+    "YouTube": ("YouTube", "homevideos"),
+}
+OTHER_LIB = ("אירועים", "homevideos")   # any other folder (weddings, brit, ...) goes here
+LIB_PLAN = {}
+
+
+async def lib_plan():
+    libs = await jf("GET", "/Library/VirtualFolders")
+    locs = [l for lib in libs for l in (lib.get("Locations") or [])]
+    base = None
+    for l in locs:
+        p = l.rstrip("/").rsplit("/", 1)
+        if len(p) == 2 and p[1] in LIB_LAYOUT:
+            base = p[0]
+            break
+    if not base:
+        raise RuntimeError("לא הצלחתי לזהות את נתיב התיקייה video בצד של ג'ליפין")
+    folders = sorted(d.name for d in media_root().iterdir() if d.is_dir() and not d.name.startswith((".", "#", "@")))
+    desired = {}
+    for f in folders:
+        name, ctype = LIB_LAYOUT.get(f, OTHER_LIB)
+        desired.setdefault(name, {"type": ctype, "paths": []})["paths"].append(f"{base}/{f}")
+    owner = {p: n for n, d in desired.items() for p in d["paths"]}
+    actions, lines = [], []
+    remaining = {lib["Name"]: list(lib.get("Locations") or []) for lib in libs}
+    for lib in libs:
+        for l in lib.get("Locations") or []:
+            tgt = owner.get(l.rstrip("/"))
+            if tgt and tgt != lib["Name"]:
+                actions.append(("rmpath", lib["Name"], l))
+                remaining[lib["Name"]].remove(l)
+    existing = {lib["Name"]: lib for lib in libs}
+    for name, d in desired.items():
+        if name in existing:
+            have = {x.rstrip("/") for x in existing[name].get("Locations") or []}
+            for p in d["paths"]:
+                if p not in have:
+                    actions.append(("addpath", name, p))
+                    remaining.setdefault(name, []).append(p)
+        else:
+            actions.append(("create", name, d))
+            remaining[name] = list(d["paths"])
+    for name, left in remaining.items():
+        if name in existing and not left and name not in desired:
+            actions.append(("delete", name, None))
+    # human readable
+    lines.append("📚 הסידור החדש:")
+    for name, d in desired.items():
+        icon = {"movies": "🎬", "tvshows": "📺", "homevideos": "📷"}[d["type"]]
+        lines.append(f"{icon} {name} ← " + ", ".join(p.rsplit('/', 1)[1] for p in d["paths"]))
+    if actions:
+        lines.append("\n🔧 שינויים:")
+        for a in actions:
+            if a[0] == "create":
+                lines.append(f"➕ ספרייה חדשה: {a[1]}")
+            elif a[0] == "addpath":
+                lines.append(f"📁 {a[1]}: מוסיף {a[2].rsplit('/', 1)[1]}")
+            elif a[0] == "rmpath":
+                lines.append(f"↪️ {a[1]}: מוציא את {a[2].rsplit('/', 1)[1]}")
+            elif a[0] == "delete":
+                lines.append(f"🗑 ספרייה ריקה תוסר: {a[1]} (הקבצים לא נמחקים)")
+    else:
+        lines.append("\n✔️ הכל כבר מסודר — אין מה לשנות.")
+    return actions, "\n".join(lines), libs
+
+
+async def lib_apply(actions, libs):
+    opts_by_type = {}
+    for lib in libs:
+        o = dict(lib.get("LibraryOptions") or {})
+        o.pop("PathInfos", None)
+        opts_by_type.setdefault(lib.get("CollectionType") or "mixed", o)
+        opts_by_type.setdefault("any", o)
+    for a in actions:
+        if a[0] == "rmpath":
+            await jf("DELETE", "/Library/VirtualFolders/Paths",
+                     params={"name": a[1], "path": a[2], "refreshLibrary": "false"})
+    for a in actions:
+        if a[0] == "create":
+            d = a[2]
+            opts = dict(opts_by_type.get(d["type"]) or opts_by_type.get("any") or {})
+            opts.setdefault("PreferredMetadataLanguage", "he")
+            opts.setdefault("MetadataCountryCode", "IL")
+            params = [("name", a[1]), ("collectionType", d["type"]), ("refreshLibrary", "false")] + \
+                     [("paths", p) for p in d["paths"]]
+            await jf("POST", "/Library/VirtualFolders", params=params, body={"LibraryOptions": opts})
+        elif a[0] == "addpath":
+            await jf("POST", "/Library/VirtualFolders/Paths", params={"refreshLibrary": "false"},
+                     body={"Name": a[1], "PathInfo": {"Path": a[2]}})
+    for a in actions:
+        if a[0] == "delete":
+            await jf("DELETE", "/Library/VirtualFolders", params={"name": a[1], "refreshLibrary": "false"})
+    await jellyfin_refresh()
 
 
 # ----------------------------------------------------------------- bot UI
@@ -1355,6 +1458,11 @@ async def bot_text(event):
                 await event.respond(f"❌ {e}"[:300])
             return
         PENDING.pop(key, None)
+    if cmd == "/libraries":
+        actions, txt, libs = await lib_plan()
+        LIB_PLAN["p"] = (actions, libs)
+        await event.respond(txt, buttons=[[Button.inline("✅ בצע", b"lb:go"), Button.inline("❌ ביטול", b"jok")]] if actions else None)
+        return
     if cmd == "/fix":
         if arg.strip():
             t, b = await jf_menu_find(arg.strip()); await event.respond(t, buttons=b)
@@ -1451,6 +1559,24 @@ async def bot_callback(event):
             await event.respond(t, buttons=b)
     elif parts[0] == "jl":
         t, b = await jf_list_view(parts[1], int(parts[2])); await edit(t, buttons=b)
+    elif data == "lb:plan":
+        await event.answer("🔍 בודק…")
+        actions, txt, libs = await lib_plan()
+        LIB_PLAN["p"] = (actions, libs)
+        await event.respond(txt, buttons=[[Button.inline("✅ בצע", b"lb:go"), Button.inline("❌ ביטול", b"jok")]] if actions else None)
+        return
+    elif data == "lb:go":
+        if "p" not in LIB_PLAN:
+            await event.answer("התוכנית פגה — פתח שוב", alert=True)
+            return
+        actions, libs = LIB_PLAN.pop("p")
+        await edit("⏳ מסדר ספריות…", buttons=None)
+        try:
+            await lib_apply(actions, libs)
+            await edit("✅ הספריות סודרו. ג'ליפין סורק עכשיו — זה יכול לקחת כמה דקות עד שהכל יופיע במסך הבית.")
+        except Exception as e:
+            await edit(f"❌ נכשל באמצע: {e}"[:400] + "\nהרץ /libraries שוב כדי לראות מה נשאר.")
+        return
     elif data == "jq":
         PENDING["jfind"] = 1
         await event.answer()
@@ -1678,6 +1804,7 @@ async def run():
                 BotCommand("torrents", "🧲 טורנטים"),
                 BotCommand("network", "🌐 רשת ביתית"),
                 BotCommand("fix", "🔧 תיקון שם/תמונה בג'ליפין"),
+                BotCommand("libraries", "🗂 סידור ספריות ג'ליפין"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
             owner_only = lambda e: e.sender_id == OWNER_ID

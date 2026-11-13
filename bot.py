@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import re
+import base64
 import io
 import shutil
 import socket
@@ -1115,13 +1116,10 @@ def jf_type(item):
 async def jf_panel(item_id, note=""):
     it = await jf_get(item_id)
     yr = f" ({it.get('ProductionYear')})" if it.get("ProductionYear") else ""
-    tm = (it.get("ProviderIds") or {}).get("Tmdb")
     path = Path(it.get("Path") or "")
     cap = (f"{note}\n" if note else "") + f"🎬 {it.get('Name')}{yr}\n📁 {path.parent.name}/{path.name}"[:300]
-    cap += f"\n🔗 TMDB {tm}" if tm else "\n⚠️ לא מזוהה ב-TMDB"
-    btn = [[Button.inline("✅ נכון", b"jok"), Button.inline("🔄 הצעות זיהוי", f"jr:{item_id}".encode())],
-           [Button.inline("🔎 חפש בשם", f"js:{item_id}".encode()), Button.inline("✏️ שנה שם", f"jn:{item_id}".encode())],
-           [Button.inline("🖼 תמונה מקישור", f"jp:{item_id}".encode())]]
+    btn = [[Button.inline("✏️ שנה שם", f"jn:{item_id}".encode()), Button.inline("🖼 החלף תמונה", f"jp:{item_id}".encode())],
+           [Button.inline("⬅️ לרשימה", b"m:fix"), Button.inline("✅ סגור", b"jok")]]
     img = None
     try:
         img = await jf("GET", f"/Items/{item_id}/Images/Primary", params={"maxHeight": "700"}, raw=True)
@@ -1184,9 +1182,51 @@ async def jf_image(item_id, url):
     await jf("POST", f"/Items/{item_id}/RemoteImages/Download", params={"type": "Primary", "imageUrl": url})
 
 
+async def jf_upload_image(item_id, data: bytes):
+    url = (CFG.get("jellyfin_url") or "").rstrip("/")
+    key = STATE.get("jellyfin_key")
+    hdr = {"Authorization": f'MediaBrowser Token="{key}"', "X-Emby-Token": key, "Content-Type": "image/jpeg"}
+    async with aiohttp.ClientSession() as s:
+        async with s.post(f"{url}/Items/{item_id}/Images/Primary", data=base64.b64encode(data), headers=hdr,
+                          timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status >= 400:
+                raise RuntimeError(f"Jellyfin HTTP {r.status}: {(await r.text())[:120]}")
+
+
+async def jf_libraries_view():
+    libs = await jf("GET", "/Library/VirtualFolders")
+    rows = [[Button.inline("🆕 נוספו לאחרונה", b"jl:new:0")]]
+    for lib in libs:
+        if lib.get("ItemId"):
+            rows.append([Button.inline(f"📚 {lib.get('Name')}", f"jl:{lib['ItemId']}:0".encode())])
+    rows.append([Button.inline("🔎 חיפוש לפי שם", b"jq"), Button.inline("⬅️ תפריט", b"m:main")])
+    return "🔧 תיקון שמות ותמונות — בחר ספרייה:", rows
+
+
+async def jf_list_view(lib, page):
+    per = 12
+    params = {"Recursive": "true", "IncludeItemTypes": "Movie,Series,Video", "Fields": "ProductionYear",
+              "SortBy": "DateCreated", "SortOrder": "Descending", "StartIndex": str(page * per), "Limit": str(per)}
+    if lib != "new":
+        params["ParentId"] = lib
+    res = await jf("GET", "/Items", params=params)
+    items, total = res.get("Items", []), res.get("TotalRecordCount", 0)
+    rows = [[Button.inline(f"{it.get('Name', '')[:34]}" + (f" ({it['ProductionYear']})" if it.get("ProductionYear") else ""),
+                           f"ji:{it['Id']}".encode())] for it in items]
+    nav = []
+    if page > 0:
+        nav.append(Button.inline("⬅️ הקודם", f"jl:{lib}:{page - 1}".encode()))
+    if (page + 1) * per < total:
+        nav.append(Button.inline("הבא ➡️", f"jl:{lib}:{page + 1}".encode()))
+    if nav:
+        rows.append(nav)
+    rows.append([Button.inline("⬅️ ספריות", b"m:fix")])
+    return f"🎬 בחר פריט ({page * per + 1}-{min((page + 1) * per, total)} מתוך {total}):", rows
+
+
 async def jf_after_download(dest: Path, delay=150):
     """Wait for Jellyfin to scan the new file, then show what it matched with fix buttons."""
-    if not STATE.get("jellyfin_key") or not CFG.get("identify_after_download", True):
+    if not STATE.get("jellyfin_key") or not CFG.get("identify_after_download", False):
         return
     await asyncio.sleep(delay)
     for _ in range(4):
@@ -1287,6 +1327,14 @@ async def bot_text(event):
             await event.respond("✏️ נשמר.\n\n" + dev_text(d), buttons=dev_buttons(mac))
         return
     PENDING.pop("rename", None)
+    if PENDING.get("jimg") and event.message.photo:
+        arg_id = PENDING.pop("jimg")
+        try:
+            await jf_upload_image(arg_id, await event.message.download_media(bytes))
+            await jf_send_panel(arg_id, "🖼 התמונה עודכנה:")
+        except Exception as e:
+            await event.respond(f"❌ {e}"[:300])
+        return
     for key in ("jfind", "jsearch", "jname", "jimg"):
         if PENDING.get(key) and text and not text.startswith("/"):
             arg_id = PENDING.pop(key)
@@ -1311,8 +1359,7 @@ async def bot_text(event):
         if arg.strip():
             t, b = await jf_menu_find(arg.strip()); await event.respond(t, buttons=b)
         else:
-            PENDING["jfind"] = 1
-            await event.respond("🔧 איזה סרט/סדרה לתקן? שלח מילה מהשם כפי שהוא מופיע בג'ליפין")
+            t, b = await jf_libraries_view(); await event.respond(t, buttons=b)
         return
     if YT_RE.search(text) and not cmd.startswith("/"):
         url = YT_RE.search(text).group(0)
@@ -1397,9 +1444,17 @@ async def bot_callback(event):
     elif data == "m:src":
         t, b = sources_view(); await edit(t, buttons=b)
     elif data == "m:fix":
+        t, b = await jf_libraries_view()
+        try:
+            await edit(t, buttons=b)
+        except Exception:
+            await event.respond(t, buttons=b)
+    elif parts[0] == "jl":
+        t, b = await jf_list_view(parts[1], int(parts[2])); await edit(t, buttons=b)
+    elif data == "jq":
         PENDING["jfind"] = 1
         await event.answer()
-        await event.respond("🔧 איזה סרט/סדרה לתקן? שלח מילה מהשם כפי שהוא מופיע בג'ליפין")
+        await event.respond("🔎 שלח מילה מהשם כפי שהוא מופיע בג'ליפין")
         return
     elif data == "jok":
         await event.answer("👍")
@@ -1422,7 +1477,7 @@ async def bot_callback(event):
         await event.answer()
         await event.respond({"js": "🔎 שלח שם לחיפוש (עברית או אנגלית, אפשר עם שנה)",
                              "jn": "✏️ שלח את השם החדש",
-                             "jp": "🖼 שלח קישור לתמונה (פוסטר). אפשר: לחיצה ארוכה על תמונה בגוגל ← העתק כתובת תמונה"}[parts[0]])
+                             "jp": "🖼 שלח תמונה (מהגלריה) או קישור לתמונה"}[parts[0]])
         return
     elif parts[0] == "ja":
         await event.answer("⏳ מעדכן…")

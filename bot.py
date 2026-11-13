@@ -36,6 +36,9 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
+VERSION = "2026.11.13-autofix"
+CHANGES = "🪄 ניקוי ספרייה אוטומטי (/autofix) · 🔄 עדכון עצמי מ-GitHub · ♻️ /restore"
+
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
 CONFIG_FILE = BASE / "config.json"
 STATE_FILE = BASE / "state.json"
@@ -1456,6 +1459,168 @@ async def restore_fixes(progress=None):
     return "\n".join(lines)
 
 
+# ----------------------------------------------------------------- automatic library cleanup
+def _tokens(s):
+    s = re.sub(r"[^\w֐-׿ ]+", " ", str(s or "").lower())
+    return {w for w in s.split() if len(w) > 1 and not w.isdigit()}
+
+
+def _sim(a, b):
+    import difflib
+    a, b = clean_title(a).lower(), clean_title(b).lower()
+    return difflib.SequenceMatcher(None, a, b).ratio() if a and b else 0.0
+
+
+def file_guess(path):
+    """Best title/year guess from the file AND its folder name."""
+    p = Path(path or "x")
+    cands = [classify(p.parent.name + p.suffix, ""), classify(p.name, "")]
+    best = max(cands, key=lambda g: (bool(g.get("year")), len(g.get("title") or "")))
+    return clean_title(best["title"]), best.get("year")
+
+
+def looks_wrong(it):
+    if "Name" in (it.get("LockedFields") or []):
+        return False                       # you fixed it by hand — never touch
+    if not (it.get("ProviderIds") or {}).get("Tmdb") and not (it.get("ProviderIds") or {}).get("Imdb"):
+        return True
+    title, year = file_guess(it.get("Path"))
+    if year and it.get("ProductionYear") and abs(int(year) - int(it["ProductionYear"])) > 1:
+        return True
+    ft = _tokens(title)
+    if ft and not (ft & (_tokens(it.get("Name")) | _tokens(it.get("OriginalTitle")))):
+        return True
+    return False
+
+
+async def autofix_library(report):
+    res = await jf("GET", "/Items", params={"Recursive": "true", "IncludeItemTypes": "Movie,Series",
+                                            "Fields": "Path,ProviderIds,ProductionYear,OriginalTitle,LockedFields"})
+    items = [it for it in res.get("Items", []) if (it.get("Path") or "") and "/YouTube/" not in it["Path"]]
+    # skip home-video libraries (events/trips)
+    suspects = [it for it in items if looks_wrong(it)]
+    await report(f"🔍 עברתי על {len(items)} סרטים וסדרות — {len(suspects)} נראים לא מזוהים או מזוהים לא נכון. מתקן…")
+    fixed, review = [], []
+    for it in suspects:
+        title, year = file_guess(it.get("Path"))
+        if not title:
+            continue
+        typ = jf_type(it)
+        try:
+            cands = await jf("POST", f"/Items/RemoteSearch/{typ}",
+                             body={"SearchInfo": {"Name": title, "Year": year}, "ItemId": it["Id"]}) or []
+            if not cands and year:
+                cands = await jf("POST", f"/Items/RemoteSearch/{typ}",
+                                 body={"SearchInfo": {"Name": title}, "ItemId": it["Id"]}) or []
+        except Exception as e:
+            log.warning("autofix search %s: %s", title, e)
+            continue
+        if not cands:
+            review.append((it, title, year, []))
+            continue
+        scored = sorted(cands[:10], key=lambda c: (_sim(title, c.get("Name")) +
+                        (0.5 if year and c.get("ProductionYear") and abs(c["ProductionYear"] - int(year)) <= 1 else 0)),
+                        reverse=True)
+        top = scored[0]
+        s = _sim(title, top.get("Name"))
+        year_ok = year and top.get("ProductionYear") and abs(top["ProductionYear"] - int(year)) <= 1
+        confident = (year_ok and s >= 0.45) or (not year and s >= 0.8 and
+                                                  (len(scored) == 1 or _sim(title, scored[1].get("Name")) < s - 0.2))
+        if confident:
+            try:
+                await jf("POST", f"/Items/RemoteSearch/Apply/{it['Id']}", params={"ReplaceAllImages": "true"}, body=top)
+                fixed.append(f"{top.get('Name')} ({top.get('ProductionYear') or '?'})")
+                await asyncio.sleep(1)
+                continue
+            except Exception as e:
+                log.warning("autofix apply %s: %s", title, e)
+        review.append((it, title, year, scored[:4]))
+    return fixed, review
+
+
+async def autofix_run():
+    async def report(t):
+        await notify(t)
+    try:
+        fixed, review = await autofix_library(report)
+    except Exception as e:
+        await notify(f"❌ הניקוי נכשל: {e}"[:300])
+        return
+    txt = f"✅ תוקנו אוטומטית {len(fixed)}:\n" + "\n".join(f"• {x}" for x in fixed[:40])
+    if len(fixed) > 40:
+        txt += f"\n…ועוד {len(fixed) - 40}"
+    txt += f"\n\n🟡 צריך את ההחלטה שלך: {len(review)}" if review else "\n\n🎉 הכל מסודר."
+    await notify(txt)
+    for it, title, year, cands in review[:30]:
+        STATE["seq"] = STATE.get("seq", 0) + 1
+        k = str(STATE["seq"])
+        JF_CAND[k] = (it["Id"], cands)
+        rows = [[Button.inline(f"{c.get('Name', '')[:30]} ({c.get('ProductionYear') or '?'})", f"ja:{k}:{i}".encode())]
+                for i, c in enumerate(cands)]
+        rows.append([Button.inline("🔎 חפש בשם", f"js:{it['Id']}".encode()), Button.inline("⏭ דלג", b"jok")])
+        p = Path(it.get("Path") or "")
+        await notify(f"🎬 {p.parent.name}\nכרגע בג'ליפין: {it.get('Name')} ({it.get('ProductionYear') or '?'})\n"
+                     f"{'בחר את הנכון:' if cands else 'לא מצאתי — חפש בשם (אפשר באנגלית):'}", buttons=rows)
+        await asyncio.sleep(0.5)
+    if len(review) > 30:
+        await notify(f"…ועוד {len(review) - 30}. אחרי שתסיים, הרץ /autofix שוב.")
+
+
+# ----------------------------------------------------------------- self update
+REPO_RAW = os.environ.get("TGMB_REPO", "https://raw.githubusercontent.com/morbriga/morbriga/tg-media-bot")
+APT_DEPS = {"ffmpeg": "ffmpeg", "arp-scan": "arp-scan", "qbittorrent-nox": "qbittorrent-nox"}
+
+
+async def self_update(force=False):
+    """Pull bot.py from GitHub; if changed and idle, swap and restart (systemd brings us back)."""
+    async with aiohttp.ClientSession() as s:
+        async with s.get(f"{REPO_RAW}/bot.py?t={int(time.time())}", timeout=aiohttp.ClientTimeout(total=60)) as r:
+            if r.status != 200:
+                return f"GitHub HTTP {r.status}"
+            new = await r.read()
+        async with s.get(f"{REPO_RAW}/requirements.txt?t={int(time.time())}", timeout=aiohttp.ClientTimeout(total=30)) as r:
+            reqs = await r.read() if r.status == 200 else None
+    cur = Path(__file__).read_bytes()
+    if new == cur:
+        return "up-to-date"
+    compile(new, "bot.py", "exec")                       # refuse broken code
+    busy = ACTIVE or any(True for _ in STATE.get("torrents", {})) or YT_LOCK.locked()
+    if busy and not force:
+        return "busy"
+    if reqs and (BASE / "requirements.txt").read_bytes() != reqs:
+        (BASE / "requirements.txt").write_bytes(reqs)
+        p = await asyncio.create_subprocess_exec(str(BASE / "venv/bin/pip"), "install", "-q", "-r",
+                                                 str(BASE / "requirements.txt"))
+        await p.wait()
+    tmp = Path(__file__).with_suffix(".new")
+    tmp.write_bytes(new)
+    tmp.replace(Path(__file__))
+    log.info("updated — restarting")
+    await asyncio.sleep(1)
+    os._exit(0)
+
+
+async def ensure_apt():
+    missing = [pkg for cmd, pkg in APT_DEPS.items() if not shutil.which(cmd)]
+    if not missing:
+        return
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    p = await asyncio.create_subprocess_exec("apt-get", "update", "-qq", env=env)
+    await p.wait()
+    p = await asyncio.create_subprocess_exec("apt-get", "install", "-y", "-qq", *missing, env=env)
+    await p.wait()
+
+
+async def updater_loop():
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await self_update()
+        except Exception as e:
+            log.warning("self update: %s", e)
+        await asyncio.sleep(600)
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
@@ -1463,7 +1628,7 @@ def main_menu():
         [Button.inline("➕ הוסף מקור", b"m:add:0"), Button.inline("📋 מקורות", b"m:src")],
         [Button.inline("🧲 טורנטים", b"m:tor"), Button.inline("📊 הורדות", b"m:st")],
         [Button.inline("🌐 רשת ביתית", b"m:net:0"), Button.inline("🔧 תיקון ג'ליפין", b"m:fix")],
-        [Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
+        [Button.inline("🪄 סדר לי את הספרייה", b"m:auto"), Button.inline("🔄 רענון ג'ליפין", b"m:jf")],
     ])
 
 
@@ -1562,6 +1727,15 @@ async def bot_text(event):
                 await event.respond(f"❌ {e}"[:300])
             return
         PENDING.pop(key, None)
+    if cmd == "/autofix":
+        await event.respond("🪄 מתחיל לעבור על כל הספרייה. זה יכול לקחת כמה דקות — אעדכן כאן.")
+        asyncio.create_task(autofix_run())
+        return
+    if cmd == "/update":
+        await event.respond("🔄 בודק עדכון…")
+        r = await self_update(force=True)
+        await event.respond({"up-to-date": "✔️ כבר בגרסה האחרונה", "busy": "⏳ יש הורדות פעילות"}.get(r, f"⚠️ {r}"))
+        return
     if cmd == "/restore":
         msg = await event.respond("♻️ קורא את היסטוריית התיקונים ומשחזר… (יכול לקחת דקה)")
         try:
@@ -1665,6 +1839,11 @@ async def bot_callback(event):
         t, b = await server_view(); await edit(t, buttons=b)
     elif data == "m:src":
         t, b = sources_view(); await edit(t, buttons=b)
+    elif data == "m:auto":
+        await event.answer("🪄 מתחיל…")
+        await event.respond("🪄 מתחיל לעבור על כל הספרייה. זה יכול לקחת כמה דקות — אעדכן כאן.")
+        asyncio.create_task(autofix_run())
+        return
     elif data == "m:fix":
         t, b = await jf_libraries_view()
         try:
@@ -1722,10 +1901,10 @@ async def bot_callback(event):
     elif parts[0] == "ja":
         await event.answer("⏳ מעדכן…")
         try:
-            item_id = await jf_apply(parts[1], int(parts[2]))
-            await edit("✅ הזיהוי עודכן", buttons=None)
-            await asyncio.sleep(4)
-            await jf_send_panel(item_id, "✅ עודכן:")
+            chosen = JF_CAND.get(parts[1], (None, []))[1]
+            chosen = chosen[int(parts[2])] if int(parts[2]) < len(chosen) else {}
+            await jf_apply(parts[1], int(parts[2]))
+            await edit(f"✅ עודכן ל: {chosen.get('Name', '')} ({chosen.get('ProductionYear') or '?'})", buttons=None)
         except Exception as e:
             await event.respond(f"❌ {e}"[:300])
         return
@@ -1919,6 +2098,7 @@ async def run():
                 BotCommand("network", "🌐 רשת ביתית"),
                 BotCommand("fix", "🔧 תיקון שם/תמונה בג'ליפין"),
                 BotCommand("libraries", "🗂 סידור ספריות ג'ליפין"),
+                BotCommand("autofix", "🪄 סדר לי את הספרייה"),
                 BotCommand("restore", "♻️ שחזור שמות ותמונות שתיקנתי"),
                 BotCommand("refresh", "🔄 רענון ג'ליפין"),
             ]))
@@ -1949,6 +2129,8 @@ async def run():
 
     QUEUE = asyncio.Queue()
     asyncio.create_task(tor_monitor())
+    asyncio.create_task(updater_loop())
+    asyncio.create_task(ensure_apt())
     if CFG.get("net_enabled", True):
         asyncio.create_task(net_monitor())
     for i in range(int(CFG.get("workers", 2))):
@@ -1976,10 +2158,14 @@ async def run():
 
     if not media_root().exists():
         await notify(f"⚠️ תיקיית המדיה {media_root()} לא נגישה — בדוק את החיבור לסינולוג'י")
-    if BOT:
+    if STATE.get("version") != VERSION:
+        STATE["version"] = VERSION
+        persist()
+        await notify(f"🆕 התעדכנתי לגרסה חדשה:\n{CHANGES}")
+    elif BOT:
         t, b = main_menu()
         await notify("🟢 המערכת עלתה.\n" + t, buttons=b)
-    else:
+    elif not BOT:
         await notify("🟢 בוט הסרטים פעיל. ליצירת לוח בקרה: צור בוט ב-@BotFather ושלח כאן /bot TOKEN")
     await USER.run_until_disconnected()
 

@@ -27,6 +27,7 @@ import io
 import shutil
 import socket
 import time
+import zipfile
 from pathlib import Path
 
 import aiohttp
@@ -36,8 +37,8 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-autofix"
-CHANGES = "🪄 ניקוי ספרייה אוטומטי (/autofix) · 🔄 עדכון עצמי מ-GitHub · ♻️ /restore"
+VERSION = "2026.11.13-dropbox"
+CHANGES = "☁️ הורדה מקישורי דרופבוקס (קובץ או תיקייה שלמה) לטיולים/אירועים/סרטים"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
 CONFIG_FILE = BASE / "config.json"
@@ -1621,6 +1622,88 @@ async def updater_loop():
         await asyncio.sleep(600)
 
 
+# ----------------------------------------------------------------- Dropbox / direct links
+DBX_RE = re.compile(r"https?://(?:www\.)?dropbox\.com/\S+")
+DBX_PENDING = {}
+MEDIA_KEEP = VIDEO_EXT | {".jpg", ".jpeg", ".png", ".heic", ".gif"}
+
+
+def dbx_direct(url):
+    url = re.sub(r"([?&])dl=0", r"\1dl=1", url)
+    if "dl=1" not in url:
+        url += ("&" if "?" in url else "?") + "dl=1"
+    return url
+
+
+async def dbx_job(url, dest_kind):
+    status = await notify("☁️ דרופבוקס: מתחיל הורדה…")
+    TMP.mkdir(parents=True, exist_ok=True)
+    tmpf = TMP / f"dbx_{int(time.time())}"
+    name, total, got, last = "Dropbox", 0, 0, 0
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(dbx_direct(url), timeout=aiohttp.ClientTimeout(total=None, sock_read=300)) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"HTTP {r.status} — ודא שהקישור משותף לצפייה")
+                cd = r.headers.get("Content-Disposition", "")
+                m = re.search(r"filename\*=UTF-8''([^;]+)", cd) or re.search(r'filename="?([^";]+)"?', cd)
+                if m:
+                    from urllib.parse import unquote
+                    name = unquote(m.group(1))
+                total = int(r.headers.get("Content-Length") or 0)
+                with open(tmpf, "wb") as f:
+                    async for chunk in r.content.iter_chunked(1 << 20):
+                        f.write(chunk)
+                        got += len(chunk)
+                        if time.time() - last > 8 and status:
+                            last = time.time()
+                            pct = f" {got * 100 // total}%" if total else ""
+                            try:
+                                await status.edit(f"☁️ דרופבוקס: {name}\n⬇️ {fmt_bytes(got)}" +
+                                                  (f" / {fmt_bytes(total)}" if total else "") + pct)
+                            except Exception:
+                                pass
+        stem = clean_title(Path(name).stem) or "Dropbox"
+        root = {"trip": media_root() / "טיולים" / stem,
+                "event": media_root() / stem,
+                "movie": None}[dest_kind]
+        moved = 0
+        if zipfile.is_zipfile(tmpf):
+            with zipfile.ZipFile(tmpf) as z:
+                for zi in z.infolist():
+                    if zi.is_dir() or Path(zi.filename).suffix.lower() not in MEDIA_KEEP:
+                        continue
+                    if dest_kind == "movie":
+                        if Path(zi.filename).suffix.lower() not in VIDEO_EXT:
+                            continue
+                        out = unique(target_path(classify(Path(zi.filename).name, "")))
+                    else:
+                        out = unique(root / Path(zi.filename).name)
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with z.open(zi) as src, open(out, "wb") as dst:
+                        await asyncio.to_thread(shutil.copyfileobj, src, dst, 1 << 20)
+                    moved += 1
+        else:
+            if dest_kind == "movie":
+                out = unique(target_path(classify(name, "")))
+            else:
+                out = unique(root / name)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.move, str(tmpf), out)
+            moved = 1
+        where = root.relative_to(media_root()) if root else "סרטים"
+        await notify(f"✅ דרופבוקס: נשמרו {moved} קבצים\n📁 {where}", edit=status)
+        if moved:
+            schedule_refresh()
+    except Exception as e:
+        await notify(f"❌ דרופבוקס נכשל: {e}"[:300], edit=status)
+    finally:
+        try:
+            tmpf.unlink()
+        except Exception:
+            pass
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
@@ -1756,6 +1839,14 @@ async def bot_text(event):
             t, b = await jf_menu_find(arg.strip()); await event.respond(t, buttons=b)
         else:
             t, b = await jf_libraries_view(); await event.respond(t, buttons=b)
+        return
+    if DBX_RE.search(text) and not cmd.startswith("/"):
+        STATE["seq"] = STATE.get("seq", 0) + 1
+        k = str(STATE["seq"])
+        DBX_PENDING[k] = DBX_RE.search(text).group(0)
+        await event.respond("☁️ קישור דרופבוקס — לאן לשמור?", buttons=[[
+            Button.inline("🏝 טיולים", f"dbx:{k}:trip".encode()), Button.inline("🎉 אירועים", f"dbx:{k}:event".encode())],
+            [Button.inline("🎬 סרטים", f"dbx:{k}:movie".encode()), Button.inline("❌ ביטול", f"dbx:{k}:x".encode())]])
         return
     if YT_RE.search(text) and not cmd.startswith("/"):
         url = YT_RE.search(text).group(0)
@@ -1946,6 +2037,14 @@ async def bot_callback(event):
             t, b = net_view(0); await edit(t, buttons=b)
             return
         await edit(dev_text(d), buttons=dev_buttons(mac))
+        return
+    elif parts[0] == "dbx":
+        url = DBX_PENDING.pop(parts[1], None)
+        if parts[2] == "x" or not url:
+            await edit("❌ בוטל" if parts[2] == "x" else "⚠️ הבקשה פגה — שלח את הקישור שוב")
+            return
+        await edit({"trip": "🏝 יורד לטיולים…", "event": "🎉 יורד לאירועים…", "movie": "🎬 יורד לסרטים…"}[parts[2]])
+        asyncio.create_task(dbx_job(url, parts[2]))
         return
     elif parts[0] == "yt":
         url = YT_PENDING.pop(parts[1], None)

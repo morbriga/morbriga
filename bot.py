@@ -37,7 +37,7 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-gdrive"
+VERSION = "2026.11.13-gdrive2"
 CHANGES = "☁️ הורדה מקישורי גוגל דרייב ודרופבוקס (קובץ או תיקייה שלמה) לטיולים/אירועים/סרטים"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
@@ -1721,8 +1721,11 @@ async def gdrive_job(url, dest_kind):
     try:
         def run():
             if is_folder:
-                return gdown.download_folder(url, output=str(work), quiet=True, remaining_ok=True, use_cookies=False)
-            return gdown.download(url, output=str(work) + "/", quiet=True, fuzzy=True, use_cookies=False)
+                return gdown.download_folder(url, output=str(work), quiet=True, use_cookies=False, retries=3)
+            m = re.search(r"/d/([\w-]+)|[?&]id=([\w-]+)", url)
+            fid = (m.group(1) or m.group(2)) if m else None
+            return gdown.download(id=fid, url=None if fid else url, output=str(work) + "/", quiet=True,
+                                  use_cookies=False, retries=3)
         task = asyncio.create_task(asyncio.to_thread(run))
         while not task.done():
             await asyncio.sleep(8)

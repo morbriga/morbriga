@@ -3,4 +3,4 @@ cryptg
 guessit>=3.8
 aiohttp>=3.9
 yt-dlp
-gdown>=5.2
+gdown>=6.0

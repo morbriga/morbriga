@@ -37,8 +37,8 @@ from telethon.tl.functions.bots import SetBotCommandsRequest
 from telethon.tl.types import BotCommand, BotCommandScopeDefault
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo
 
-VERSION = "2026.11.13-gdrive3"
-CHANGES = "♻️ שחזור אוטומטי של כל השמות והתמונות שתיקנת מהצ'אט (רץ לבד, מנסה שוב עד שהכל נמצא)"
+VERSION = "2026.11.14-cloudflare"
+CHANGES = "☁️ /cloudflare — חיבור ג'ליפין לצפייה מבחוץ דרך מנהרת Cloudflare"
 
 BASE = Path(os.environ.get("TGMB_HOME", "/opt/tgmedia"))
 CONFIG_FILE = BASE / "config.json"
@@ -1835,6 +1835,36 @@ async def gdrive_job(url, dest_kind):
         shutil.rmtree(work, ignore_errors=True)
 
 
+# ----------------------------------------------------------------- Cloudflare tunnel
+async def sh(*args, env=None):
+    p = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                                             env=env)
+    out, _ = await p.communicate()
+    return p.returncode, out.decode("utf-8", "ignore")[-400:]
+
+
+async def cf_install(token):
+    if not shutil.which("cloudflared"):
+        deb = TMP / "cloudflared.deb"
+        TMP.mkdir(parents=True, exist_ok=True)
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb",
+                             timeout=aiohttp.ClientTimeout(total=300)) as r:
+                if r.status != 200:
+                    raise RuntimeError(f"הורדת cloudflared נכשלה (HTTP {r.status})")
+                deb.write_bytes(await r.read())
+        rc, out = await sh("dpkg", "-i", str(deb))
+        if rc != 0:
+            raise RuntimeError("התקנה נכשלה: " + out)
+    await sh("cloudflared", "service", "uninstall")
+    rc, out = await sh("cloudflared", "service", "install", token)
+    if rc != 0:
+        raise RuntimeError("הפעלת המנהרה נכשלה: " + out)
+    await asyncio.sleep(8)
+    rc, out = await sh("systemctl", "is-active", "cloudflared")
+    return out.strip()
+
+
 # ----------------------------------------------------------------- bot UI
 def main_menu():
     return ("🏠 לוח בקרה", [
@@ -1941,6 +1971,22 @@ async def bot_text(event):
                 await event.respond(f"❌ {e}"[:300])
             return
         PENDING.pop(key, None)
+    if cmd == "/cloudflare":
+        tok = arg.strip()
+        try:
+            await event.delete()
+        except Exception:
+            pass
+        if not tok:
+            await event.respond("שלח: /cloudflare <TOKEN> (הטוקן של ה-Tunnel מ-Cloudflare)")
+            return
+        m = await event.respond("☁️ מתקין את מנהרת Cloudflare…")
+        try:
+            st = await cf_install(tok)
+            await m.edit("✅ מנהרת Cloudflare פעילה" if st == "active" else f"⚠️ מצב השירות: {st}")
+        except Exception as e:
+            await m.edit(f"❌ {e}"[:400])
+        return
     if cmd == "/autofix":
         await event.respond("🪄 מתחיל לעבור על כל הספרייה. זה יכול לקחת כמה דקות — אעדכן כאן.")
         asyncio.create_task(autofix_run())
